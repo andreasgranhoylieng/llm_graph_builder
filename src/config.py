@@ -241,6 +241,6 @@ ENABLE_DETAILED_LOGGING = True
 # =============================================================================
 # VECTOR SEARCH CONFIGURATION
 # =============================================================================
-VECTOR_SEARCH_TOP_K = 10
+VECTOR_SEARCH_TOP_K = 30
 VECTOR_SEARCH_SCORE_THRESHOLD = 0.7
-HYBRID_SEARCH_DEPTH = 2  # Hops for graph expansion after vector search
+HYBRID_SEARCH_DEPTH = 10  # Hops for graph expansion after vector search
