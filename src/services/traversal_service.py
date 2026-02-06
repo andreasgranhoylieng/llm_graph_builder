@@ -37,21 +37,41 @@ class TraversalService(ITraversalService):
         path = self.neo4j_repo.find_path(entity_a, entity_b, max_depth)
 
         if path:
-            # Build human-readable description
+            # Build human-readable description, filtering out Document nodes
             description_parts = []
             nodes = path.get("nodes", [])
             relationships = path.get("relationships", [])
 
-            for i, node in enumerate(nodes):
-                description_parts.append(node.get("name", node.get("id")))
-                if i < len(relationships):
-                    rel_type = relationships[i].get("type", "RELATED_TO")
-                    description_parts.append(f" --[{rel_type}]--> ")
+            # Filter out Document nodes for cleaner display
+            visible_nodes = []
+            for node in nodes:
+                labels = node.get("labels", [])
+                # Skip Document nodes (they have hash IDs)
+                if "Document" in labels:
+                    continue
+                visible_nodes.append(node)
+
+            for i, node in enumerate(visible_nodes):
+                # Get clean name, falling back to id
+                name = node.get("name") or node.get("id", "Unknown")
+                # Clean up hash-like names
+                if len(name) == 32 and all(
+                    c in "0123456789abcdef" for c in name.lower()
+                ):
+                    continue  # Skip hash IDs
+                description_parts.append(name)
+                if i < len(visible_nodes) - 1:
+                    # Try to find the relationship between these nodes
+                    if i < len(relationships):
+                        rel_type = relationships[i].get("type", "RELATED_TO")
+                        description_parts.append(f" --[{rel_type}]--> ")
+                    else:
+                        description_parts.append(" --> ")
 
             return {
                 "connected": True,
                 "path": path,
-                "hops": len(nodes) - 1,
+                "hops": len(visible_nodes) - 1 if visible_nodes else 0,
                 "description": "".join(description_parts),
             }
 

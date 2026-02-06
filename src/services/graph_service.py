@@ -276,6 +276,10 @@ class GraphService:
                 # Add source tracking
                 node.properties["source_document"] = source_id
 
+                # Clean and set proper name
+                clean_name = self._clean_node_name(node.id)
+                node.properties["name"] = clean_name
+
                 # Generate description from source if not present
                 if not node.properties.get("description"):
                     # Extract relevant context from source text
@@ -334,6 +338,59 @@ class GraphService:
             description = description[:max_length].rsplit(" ", 1)[0] + "..."
 
         return description
+
+    def _clean_node_name(self, node_id: str, max_length: int = 50) -> str:
+        """
+        Clean and normalize a node ID to create a readable name.
+
+        Handles:
+        - URLs: Extract domain or title
+        - Long paper titles: Truncate to first meaningful part
+        - Numeric IDs: Convert to readable format
+        - Normal names: Title case normalization
+        """
+        import re
+
+        if not node_id:
+            return "Unknown"
+
+        name = str(node_id).strip()
+
+        # Skip if it's a URL - try to extract meaningful part
+        if name.startswith("http://") or name.startswith("https://"):
+            # Extract the last path segment or domain
+            parts = name.split("/")
+            for part in reversed(parts):
+                if part and not part.startswith("http") and len(part) > 3:
+                    name = part.replace("-", " ").replace("_", " ")
+                    break
+            else:
+                return "External Link"
+
+        # Remove common URL artifacts
+        name = re.sub(r"https?://[^\s]+", "", name)
+        name = re.sub(r"www\.\S+", "", name)
+
+        # If it looks like a long sentence/title, truncate smartly
+        if len(name) > max_length:
+            # Try to find a good break point
+            if ":" in name[:max_length]:
+                name = name.split(":")[0].strip()
+            elif " - " in name[:max_length]:
+                name = name.split(" - ")[0].strip()
+            elif "'" in name[:max_length]:
+                # Preserve quoted names like "Musk's xAI"
+                pass
+            else:
+                # Just truncate at word boundary
+                name = name[:max_length].rsplit(" ", 1)[0]
+                if not name.endswith("..."):
+                    name += "..."
+
+        # Clean up extra whitespace
+        name = " ".join(name.split())
+
+        return name if name else "Unknown"
 
     def _get_timestamp(self) -> str:
         """Get current ISO timestamp."""
