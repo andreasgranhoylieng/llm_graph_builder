@@ -1,0 +1,30 @@
+# Python Caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment Variables
+.env
+
+# Virtual Environments
+.venv/
+env/
+venv/
+ENV/
+
+# Logs
+logs/
+
+# Checkpoints (Neo4j/LLM related)
+checkpoints/
+
+# Data (Sensitive or Large files)
+data/
+
+# OS Files
+.DS_Store
+Thumbs.db
+
+# IDEs
+.vscode/
+.idea/
