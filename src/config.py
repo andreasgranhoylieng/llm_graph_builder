@@ -14,6 +14,10 @@ NEO4J_DATABASE = os.getenv("NEO4J_DATABASE", "neo4j")
 LLM_MODEL = "gpt-4o-mini-2024-07-18"  # or gpt-4-turbo, gpt-3.5-turbo, gpt-4o-mini
 LLM_TEMPERATURE = 0.0
 
+# Embedding Configuration
+EMBEDDING_MODEL = "text-embedding-3-large"
+EMBEDDING_DIMENSION = 3072  # For text-embedding-3-large
+
 # --- SCHEMA DEFINITION ---
 # This restricts the LLM to specific types, preventing graph chaos.
 ALLOWED_NODES = [

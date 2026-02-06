@@ -3,11 +3,44 @@ Neo4j Repository - Handles all Neo4j database operations with bulk insert suppor
 """
 
 from typing import List
-from langchain_neo4j import Neo4jGraph
-from langchain_openai import ChatOpenAI
-from langchain_community.chains.graph_qa.cypher import GraphCypherQAChain
+from langchain_neo4j import Neo4jGraph, GraphCypherQAChain
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+
+# from langchain_community.chains.graph_qa.cypher import GraphCypherQAChain
 from src.services.interfaces import INeo4jRepository
 from src import config
+from langchain_core.prompts import PromptTemplate
+
+CYPHER_GENERATION_TEMPLATE = """Task:Generate Cypher statement to query a graph database.
+Instructions:
+Use only the provided relationship types and properties in the schema.
+Do not use any other relationship types or properties that are not provided.
+Schema:
+{schema}
+
+Note: Do not include any explanations or apologies in your response.
+Do not respond to any questions that might ask you to confirm anything other than appearing as a Cypher query engine.
+Do not include any text except the generated Cypher statement.
+
+Important:
+1. For entity matching, prefer using the `entity_embeddings` vector index if the exact ID is not known or if common abbreviations are used.
+   Example for vector search:
+   MATCH (n:__Entity__)
+   CALL db.index.vector.queryNodes('entity_embeddings', 1, $embedding) YIELD node, score
+   WHERE score > 0.8
+   RETURN node
+
+2. Alternatively, use case-insensitive matching with `toLower()` and `CONTAINS` for robust string lookups.
+   Example: MATCH (n:Organization) WHERE toLower(n.id) CONTAINS toLower('xai') RETURN n
+
+3. Always return relevant nodes and their relationships to answer the question.
+
+The question is:
+{question}"""
+
+CYPHER_GENERATION_PROMPT = PromptTemplate(
+    input_variables=["schema", "question"], template=CYPHER_GENERATION_TEMPLATE
+)
 
 
 class Neo4jRepository(INeo4jRepository):
@@ -15,6 +48,7 @@ class Neo4jRepository(INeo4jRepository):
 
     def __init__(self):
         self._graph = None
+        self._embeddings = None
 
     def _get_graph(self):
         if self._graph is None:
@@ -72,6 +106,58 @@ class Neo4jRepository(INeo4jRepository):
                     batch, baseEntityLabel=True, include_source=include_source
                 )
 
+                # --- EMBEDDING GENERATION ---
+                # 1. Extract unique entities from this batch
+                nodes_to_embed = {}  # id -> label
+                for g_doc in batch:
+                    for node in g_doc.nodes:
+                        if node.id not in nodes_to_embed:
+                            nodes_to_embed[node.id] = node.type
+
+                if nodes_to_embed:
+                    node_ids = list(nodes_to_embed.keys())
+                    embeddings = self._get_embeddings().embed_documents(node_ids)
+
+                    update_query = """
+                    UNWIND $data as item
+                    MATCH (n {id: item.id})
+                    SET n.embedding = item.embedding
+                    """
+                    data = [
+                        {"id": nid, "embedding": emb}
+                        for nid, emb in zip(node_ids, embeddings)
+                    ]
+                    graph.query(update_query, params={"data": data})
+
+                # 2. Extract Document chunks to embed
+                docs_to_embed = []
+                for g_doc in batch:
+                    if hasattr(g_doc, "source"):
+                        doc_id = g_doc.source.metadata.get(
+                            "id"
+                        ) or g_doc.source.metadata.get("source")
+                        doc_content = g_doc.source.page_content
+                        if doc_id and doc_content:
+                            docs_to_embed.append({"id": doc_id, "content": doc_content})
+
+                if docs_to_embed:
+                    doc_contents = [d["content"] for d in docs_to_embed]
+                    doc_embeddings = self._get_embeddings().embed_documents(
+                        doc_contents
+                    )
+
+                    doc_update_query = """
+                    UNWIND $data as item
+                    MATCH (d:Document {id: item.id})
+                    SET d.embedding = item.embedding
+                    """
+                    doc_data = [
+                        {"id": d["id"], "embedding": emb}
+                        for d, emb in zip(docs_to_embed, doc_embeddings)
+                    ]
+                    graph.query(doc_update_query, params={"data": doc_data})
+                # ----------------------------
+
                 # Count nodes and relationships
                 for doc in batch:
                     total_nodes += len(doc.nodes) if hasattr(doc, "nodes") else 0
@@ -112,6 +198,10 @@ class Neo4jRepository(INeo4jRepository):
             "CREATE INDEX IF NOT EXISTS FOR (n:Document) ON (n.id)",
             # Full-text search index (optional)
             # "CREATE FULLTEXT INDEX entityNames IF NOT EXISTS FOR (n:__Entity__) ON EACH [n.id]",
+            # Vector Index for entities
+            f"CREATE VECTOR INDEX entity_embeddings IF NOT EXISTS FOR (n:__Entity__) ON (n.embedding) OPTIONS {{indexConfig: {{ `vector.dimensions`: {config.EMBEDDING_DIMENSION}, `vector.similarity_function`: 'cosine' }}}},",
+            # Vector Index for documents (chunks)
+            f"CREATE VECTOR INDEX document_embeddings IF NOT EXISTS FOR (d:Document) ON (d.embedding) OPTIONS {{indexConfig: {{ `vector.dimensions`: {config.EMBEDDING_DIMENSION}, `vector.similarity_function`: 'cosine' }}}}",
         ]
 
         for query in index_queries:
@@ -121,7 +211,7 @@ class Neo4jRepository(INeo4jRepository):
                 # Index might already exist or not be supported
                 pass
 
-        print("📇 Database indexes created/verified")
+        print("Database indexes created/verified")
 
     def get_statistics(self) -> dict:
         """Get database statistics."""
@@ -183,15 +273,37 @@ class Neo4jRepository(INeo4jRepository):
 
         llm = ChatOpenAI(temperature=0, model_name=config.LLM_MODEL)
 
+        # We can pass the embeddings to the chain if needed for vector search in Cypher
+        # However, GraphCypherQAChain usually handles direct query generation.
+        # To support vector search, we might need to pre-process the question or
+        # use a custom chain. For now, we'll use the prompt to guide the LLM.
+
         chain = GraphCypherQAChain.from_llm(
-            graph=graph, llm=llm, verbose=True, allow_dangerous_requests=True
+            graph=graph,
+            llm=llm,
+            verbose=True,
+            allow_dangerous_requests=True,
+            cypher_prompt=CYPHER_GENERATION_PROMPT,
         )
 
         try:
-            response = chain.invoke({"query": question})
+            # We provide the embedding of the question in case the Cypher query wants to use it
+            question_embedding = self._get_embeddings().embed_query(question)
+
+            response = chain.invoke(
+                {"query": question, "embedding": question_embedding}
+            )
             return response.get("result", "No answer found.")
         except Exception as e:
             return f"Error processing query: {e}"
 
     def refresh_schema(self):
         self._get_graph().refresh_schema()
+
+    def _get_embeddings(self):
+        """Lazy initialization of embeddings."""
+        if self._embeddings is None:
+            self._embeddings = OpenAIEmbeddings(
+                model=config.EMBEDDING_MODEL, openai_api_key=config.OPENAI_API_KEY
+            )
+        return self._embeddings
