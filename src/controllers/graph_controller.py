@@ -1,13 +1,15 @@
 """
-GraphController - Orchestrates graph building with batch processing and checkpointing.
+GraphController - Orchestrates graph building with batch processing, checkpointing,
+and advanced querying capabilities.
 """
 
 import os
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Dict, Any
 
 from src.services.ingest_service import IngestService
 from src.services.graph_service import GraphService
+from src.services.traversal_service import TraversalService
 from src.services.progress_tracker import ChunkProgressTracker
 from src.repositories.file_repository import FileRepository
 from src.repositories.neo4j_repository import Neo4jRepository
@@ -16,7 +18,7 @@ from src import config
 
 
 class GraphController:
-    """Controller for graph building operations with large-scale processing support."""
+    """Controller for graph building operations with large-scale processing and advanced querying."""
 
     def __init__(self):
         # Wire up dependencies (following DDD architecture)
@@ -25,6 +27,7 @@ class GraphController:
 
         self.ingest_service = IngestService(file_repo)
         self.graph_service = GraphService(neo4j_repo)
+        self.traversal_service = TraversalService(neo4j_repo)
         self.file_repo = file_repo
         self.neo4j_repo = neo4j_repo
         self.state_repo = ProcessingStateRepository()
@@ -46,7 +49,7 @@ class GraphController:
             return f"Error during graph building: {str(e)}"
 
     def chat(self, question: str):
-        """Orchestrates graph querying."""
+        """Orchestrates graph querying using legacy Cypher-based approach."""
         if not question.strip():
             return "Question cannot be empty."
 
@@ -54,6 +57,121 @@ class GraphController:
             return self.graph_service.query_graph(question)
         except Exception as e:
             return f"Error during chat: {str(e)}"
+
+    # =========================================================================
+    # ENHANCED QUERYING METHODS
+    # =========================================================================
+
+    def chat_hybrid(self, question: str) -> Dict[str, Any]:
+        """
+        Query using hybrid vector search + graph traversal.
+
+        Returns structured response with:
+        - answer: The synthesized answer
+        - entities_found: Relevant entities from vector search
+        - graph_context: Related entities from graph traversal
+        - confidence: Confidence score
+        """
+        if not question.strip():
+            return {"error": "Question cannot be empty."}
+
+        try:
+            return self.graph_service.query_graph_hybrid(question)
+        except Exception as e:
+            return {"error": f"Error during hybrid query: {str(e)}"}
+
+    def explore_entity(self, entity_name: str) -> Dict[str, Any]:
+        """
+        Explore an entity and its context in the knowledge graph.
+
+        Args:
+            entity_name: Name or ID of the entity to explore
+
+        Returns:
+            Comprehensive context including neighbors, relationships, and sources
+        """
+        try:
+            # First, try to find the entity via vector search
+            matches = self.neo4j_repo.vector_search(
+                entity_name, top_k=1, score_threshold=0.6
+            )
+
+            if not matches:
+                return {
+                    "found": False,
+                    "message": f"Entity '{entity_name}' not found in the knowledge graph.",
+                }
+
+            entity_id = matches[0]["id"]
+            return self.traversal_service.get_entity_context(entity_id, context_depth=2)
+
+        except Exception as e:
+            return {"error": f"Error exploring entity: {str(e)}"}
+
+    def find_connections(self, entity_a: str, entity_b: str) -> Dict[str, Any]:
+        """
+        Find how two entities are connected in the knowledge graph.
+        """
+        try:
+            # Find entity IDs via vector search
+            match_a = self.neo4j_repo.vector_search(
+                entity_a, top_k=1, score_threshold=0.6
+            )
+            match_b = self.neo4j_repo.vector_search(
+                entity_b, top_k=1, score_threshold=0.6
+            )
+
+            if not match_a:
+                return {"error": f"Entity '{entity_a}' not found."}
+            if not match_b:
+                return {"error": f"Entity '{entity_b}' not found."}
+
+            return self.traversal_service.find_connections(
+                match_a[0]["id"], match_b[0]["id"]
+            )
+
+        except Exception as e:
+            return {"error": f"Error finding connections: {str(e)}"}
+
+    def get_similar_entities(self, entity_name: str, top_k: int = 5) -> Dict[str, Any]:
+        """
+        Find entities similar to the given one.
+        """
+        try:
+            matches = self.neo4j_repo.vector_search(
+                entity_name, top_k=1, score_threshold=0.6
+            )
+
+            if not matches:
+                return {"found": False, "message": f"Entity '{entity_name}' not found."}
+
+            entity_id = matches[0]["id"]
+            similar = self.traversal_service.find_similar_entities(entity_id, top_k)
+
+            return {"entity": matches[0], "similar_entities": similar}
+
+        except Exception as e:
+            return {"error": f"Error finding similar entities: {str(e)}"}
+
+    def get_model_info(self, model_name: str) -> Dict[str, Any]:
+        """
+        Get comprehensive information about an AI model.
+
+        Specialized method for Generative AI domain.
+        """
+        try:
+            return self.traversal_service.get_model_knowledge(model_name)
+        except Exception as e:
+            return {"error": f"Error getting model info: {str(e)}"}
+
+    def compare_models(self, model_a: str, model_b: str) -> Dict[str, Any]:
+        """
+        Compare two AI models.
+        """
+        try:
+            return self.traversal_service.compare_models(model_a, model_b)
+        except Exception as e:
+            return {"error": f"Error comparing models: {str(e)}"}
 
     # =========================================================================
     # LARGE-SCALE PROCESSING METHODS
@@ -64,14 +182,6 @@ class GraphController:
     ) -> str:
         """
         Process folder with batching, checkpointing, and progress tracking.
-
-        Args:
-            folder_path: Path to folder containing PDF/TXT files
-            resume: If True, resume from last checkpoint
-            job_id: Unique identifier for this processing job
-
-        Returns:
-            Summary message
         """
         print("\n" + "=" * 60)
         print("🚀 LARGE-SCALE GRAPH BUILDER")
@@ -240,7 +350,7 @@ class GraphController:
         # Save state
         self.state_repo.save_checkpoint(state, job_id)
 
-        # Resume processing (will pick up the previously failed files)
+        # Resume processing
         return self.process_folder_batch(resume=True, job_id=job_id)
 
     def reset_job(self, job_id: str = "default") -> str:
@@ -274,7 +384,6 @@ class GraphController:
             "📋 Sample files:",
         ]
 
-        # Show first 10 files
         for f in stats["files"][:10]:
             lines.append(f"   - {os.path.basename(f)}")
 
@@ -284,3 +393,23 @@ class GraphController:
         lines.append("=" * 60)
 
         return "\n".join(lines)
+
+    # =========================================================================
+    # ADVANCED CYPHER QUERIES
+    # =========================================================================
+
+    def execute_cypher(self, query: str, params: dict = None) -> list:
+        """
+        Execute a raw Cypher query (for advanced users).
+
+        Args:
+            query: Cypher query string
+            params: Optional query parameters
+
+        Returns:
+            Query results
+        """
+        try:
+            return self.neo4j_repo.execute_cypher(query, params)
+        except Exception as e:
+            return [{"error": str(e)}]

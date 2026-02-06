@@ -1,70 +1,246 @@
 import os
 from dotenv import load_dotenv
+from typing import List, Dict, Any
 
 load_dotenv()
 
-# API Keys and DB Config
+# =============================================================================
+# API KEYS AND DATABASE CONFIGURATION
+# =============================================================================
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 NEO4J_URI = os.getenv("NEO4J_URI")
 NEO4J_USERNAME = os.getenv("NEO4J_USERNAME")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
 NEO4J_DATABASE = os.getenv("NEO4J_DATABASE", "neo4j")
 
-# LLM Configuration
-LLM_MODEL = "gpt-4o-mini-2024-07-18"  # or gpt-4-turbo, gpt-3.5-turbo, gpt-4o-mini
+# =============================================================================
+# LLM CONFIGURATION
+# =============================================================================
+LLM_MODEL = "gpt-4o-mini-2024-07-18"
 LLM_TEMPERATURE = 0.0
 
-# Embedding Configuration
+# =============================================================================
+# EMBEDDING CONFIGURATION
+# =============================================================================
 EMBEDDING_MODEL = "text-embedding-3-large"
 EMBEDDING_DIMENSION = 3072  # For text-embedding-3-large
 
-# --- SCHEMA DEFINITION ---
-# This restricts the LLM to specific types, preventing graph chaos.
-ALLOWED_NODES = [
-    "Person",
-    "Organization",
-    "Technology",
-    "Event",
-    "Product",
-    "Concept",
-    "Location",
+# =============================================================================
+# GENERATIVE AI KNOWLEDGE GRAPH SCHEMA
+# =============================================================================
+# This schema is optimized for Generative AI domain knowledge extraction.
+# It captures AI models, companies, research, datasets, and their relationships.
+
+ALLOWED_NODES: List[str] = [
+    # Core AI Entities
+    "AIModel",  # GPT-4, Claude, Llama, Gemini, etc.
+    "AICompany",  # OpenAI, Anthropic, Google DeepMind, Meta AI, etc.
+    "Researcher",  # Key researchers and scientists
+    "Paper",  # Research papers and publications
+    "Dataset",  # Training datasets (ImageNet, Common Crawl, etc.)
+    # Technical Components
+    "Architecture",  # Transformer, Diffusion, GAN, etc.
+    "Technique",  # RLHF, RAG, LoRA, Quantization, etc.
+    "Benchmark",  # MMLU, HumanEval, GLUE, etc.
+    "Framework",  # PyTorch, TensorFlow, JAX, LangChain, etc.
+    # Applications & Products
+    "Application",  # ChatGPT, Copilot, Midjourney, etc.
+    "UseCase",  # Code generation, Image synthesis, etc.
+    "Feature",  # Context window, Function calling, Vision, etc.
+    # Domain & Context
+    "Concept",  # Abstract concepts (attention, emergence, hallucination)
+    "Organization",  # Non-AI companies, universities, labs
+    "Event",  # Conferences, releases, announcements
+    "License",  # MIT, Apache 2.0, Proprietary, etc.
 ]
 
-ALLOWED_RELATIONSHIPS = [
-    "WORKS_AT",
-    "DEVELOPED",
-    "RELEASED",
-    "ACQUIRED",
-    "PART_OF",
-    "LOCATED_AT",
-    "RELATED_TO",
+ALLOWED_RELATIONSHIPS: List[str] = [
+    # Creation & Development
+    "DEVELOPED_BY",  # Model -> Company/Researcher
+    "CREATED",  # Company/Researcher -> Model/Paper
+    "AUTHORED",  # Researcher -> Paper
+    "TRAINED_ON",  # Model -> Dataset
+    "FINE_TUNED_FROM",  # Model -> Model (base model relationship)
+    # Technical Architecture
+    "USES_ARCHITECTURE",  # Model -> Architecture
+    "IMPLEMENTS",  # Model/Framework -> Technique
+    "BASED_ON",  # Architecture/Model -> Paper/Concept
+    "EXTENDS",  # Technique -> Technique
+    "REQUIRES",  # Model -> Framework/Technique
+    # Performance & Evaluation
+    "EVALUATED_ON",  # Model -> Benchmark
+    "OUTPERFORMS",  # Model -> Model (with score property)
+    "ACHIEVES",  # Model -> Benchmark (with score property)
+    # Products & Applications
+    "POWERS",  # Model -> Application
+    "HAS_FEATURE",  # Model/Application -> Feature
+    "SUPPORTS",  # Framework -> Technique/Feature
+    "ENABLES",  # Technique -> UseCase
+    # Organizational
+    "AFFILIATED_WITH",  # Researcher -> Organization/Company
+    "ACQUIRED",  # Company -> Company
+    "PARTNERED_WITH",  # Company -> Company
+    "FUNDED_BY",  # Company -> Organization
+    "RELEASED_AT",  # Model/Paper -> Event
+    # Licensing & Access
+    "LICENSED_UNDER",  # Model/Dataset -> License
+    # Semantic Relationships
+    "RELATED_TO",  # General semantic connection
+    "SIMILAR_TO",  # Similar models/techniques
+    "CONTRASTS_WITH",  # Opposing approaches
+    "PART_OF",  # Component relationships
+    "INSTANCE_OF",  # Type hierarchies
+    "SUCCEEDED_BY",  # Temporal succession
 ]
+
+# =============================================================================
+# NODE PROPERTY SCHEMA
+# =============================================================================
+# Defines required and optional properties for each node type.
+# This ensures consistent data structure for embeddings and queries.
+
+NODE_PROPERTY_SCHEMA: Dict[str, Dict[str, Any]] = {
+    "__Entity__": {
+        # Base properties for ALL entities
+        "required": ["id", "name"],
+        "optional": [
+            "description",
+            "aliases",
+            "source_document",
+            "source_chunk",
+            "confidence",
+            "created_at",
+        ],
+        "embedding_fields": [
+            "name",
+            "description",
+        ],  # Fields used for vector embeddings
+    },
+    "AIModel": {
+        "required": ["id", "name"],
+        "optional": [
+            "description",
+            "release_date",
+            "parameters",
+            "context_length",
+            "training_tokens",
+            "modality",
+            "open_source",
+            "version",
+            "aliases",
+            "source_document",
+            "source_chunk",
+            "confidence",
+        ],
+        "embedding_fields": ["name", "description"],
+    },
+    "AICompany": {
+        "required": ["id", "name"],
+        "optional": [
+            "description",
+            "founded_date",
+            "headquarters",
+            "valuation",
+            "employee_count",
+            "website",
+            "aliases",
+            "source_document",
+        ],
+        "embedding_fields": ["name", "description"],
+    },
+    "Researcher": {
+        "required": ["id", "name"],
+        "optional": [
+            "description",
+            "affiliation",
+            "h_index",
+            "notable_work",
+            "aliases",
+            "source_document",
+        ],
+        "embedding_fields": ["name", "description", "notable_work"],
+    },
+    "Paper": {
+        "required": ["id", "name"],
+        "optional": [
+            "description",
+            "abstract",
+            "publication_date",
+            "venue",
+            "citation_count",
+            "arxiv_id",
+            "doi",
+            "aliases",
+            "source_document",
+        ],
+        "embedding_fields": ["name", "description", "abstract"],
+    },
+    "Architecture": {
+        "required": ["id", "name"],
+        "optional": [
+            "description",
+            "introduced_in",
+            "key_innovation",
+            "aliases",
+            "source_document",
+        ],
+        "embedding_fields": ["name", "description", "key_innovation"],
+    },
+    "Technique": {
+        "required": ["id", "name"],
+        "optional": [
+            "description",
+            "category",
+            "introduced_in",
+            "aliases",
+            "source_document",
+        ],
+        "embedding_fields": ["name", "description"],
+    },
+}
+
+# =============================================================================
+# RELATIONSHIP PROPERTY SCHEMA
+# =============================================================================
+RELATIONSHIP_PROPERTIES: Dict[str, List[str]] = {
+    "OUTPERFORMS": ["benchmark", "score_difference", "metric"],
+    "ACHIEVES": ["score", "metric", "date"],
+    "TRAINED_ON": ["data_percentage", "tokens_used"],
+    "FINE_TUNED_FROM": ["method", "dataset_used"],
+    # All relationships can have these
+    "__default__": ["source_chunk_text", "source_file", "confidence", "extracted_at"],
+}
 
 # =============================================================================
 # LARGE-SCALE PROCESSING CONFIGURATION
 # =============================================================================
+BATCH_SIZE_FILES = 10
+BATCH_SIZE_CHUNKS = 50
+MAX_CONCURRENT_LLM_CALLS = 5
 
-# Batch Processing Configuration
-BATCH_SIZE_FILES = 10  # Files per batch
-BATCH_SIZE_CHUNKS = 50  # Chunks per LLM batch
-MAX_CONCURRENT_LLM_CALLS = 5  # Parallel LLM requests
-
-# Rate Limiting (OpenAI tier-dependent - adjust based on your tier)
-RATE_LIMIT_RPM = 500  # Requests per minute
-RATE_LIMIT_TPM = 150000  # Tokens per minute
+# Rate Limiting (OpenAI tier-dependent)
+RATE_LIMIT_RPM = 500
+RATE_LIMIT_TPM = 150000
 
 # Checkpointing
 CHECKPOINT_DIR = "./checkpoints"
-CHECKPOINT_INTERVAL = 10  # Save state every N files
+CHECKPOINT_INTERVAL = 10
 
 # Memory Management
-MAX_MEMORY_MB = 4096  # Memory limit before forcing batch flush
+MAX_MEMORY_MB = 4096
 
 # Retry Configuration
 MAX_RETRIES = 3
 RETRY_DELAY_SECONDS = 5
-RETRY_BACKOFF_MULTIPLIER = 2  # Exponential backoff multiplier
+RETRY_BACKOFF_MULTIPLIER = 2
 
 # Logging
 LOG_DIR = "./logs"
 ENABLE_DETAILED_LOGGING = True
+
+# =============================================================================
+# VECTOR SEARCH CONFIGURATION
+# =============================================================================
+VECTOR_SEARCH_TOP_K = 10
+VECTOR_SEARCH_SCORE_THRESHOLD = 0.7
+HYBRID_SEARCH_DEPTH = 2  # Hops for graph expansion after vector search

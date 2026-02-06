@@ -1,5 +1,6 @@
 """
 GraphService - Handles graph extraction with concurrent processing and rate limiting.
+Enhanced with description extraction for better embeddings.
 """
 
 from typing import List, Optional, Callable
@@ -35,18 +36,20 @@ class GraphService:
             self._llm = ChatOpenAI(
                 temperature=config.LLM_TEMPERATURE,
                 model_name=config.LLM_MODEL,
-                request_timeout=120,  # Longer timeout for large chunks
+                request_timeout=120,
             )
         return self._llm
 
     @property
     def transformer(self) -> LLMGraphTransformer:
-        """Lazy initialization of graph transformer."""
+        """Lazy initialization of graph transformer with Generative AI schema."""
         if self._transformer is None:
             self._transformer = LLMGraphTransformer(
                 llm=self.llm,
                 allowed_nodes=config.ALLOWED_NODES,
                 allowed_relationships=config.ALLOWED_RELATIONSHIPS,
+                node_properties=True,  # Enable property extraction
+                relationship_properties=True,  # Enable relationship properties
             )
         return self._transformer
 
@@ -64,7 +67,7 @@ class GraphService:
 
         graph_documents = self.transformer.convert_to_graph_documents(docs)
 
-        # Enrich relationships with source text for better visualization
+        # Enrich with descriptions and source tracking
         self._enrich_graph_documents(graph_documents)
 
         print(f"✅ Extracted {len(graph_documents)} graph components.")
@@ -82,14 +85,6 @@ class GraphService:
     ) -> dict:
         """
         Process documents in batches with rate limiting.
-
-        Args:
-            docs: List of document chunks to process
-            batch_size: Number of chunks per batch
-            progress_callback: Optional callback(processed, total) for progress updates
-
-        Returns:
-            Statistics about the processing
         """
         batch_size = batch_size or config.BATCH_SIZE_CHUNKS
 
@@ -108,7 +103,7 @@ class GraphService:
 
             try:
                 # Acquire rate limit permission
-                estimated_tokens = len(batch) * 2000  # Rough estimate
+                estimated_tokens = len(batch) * 2000
                 wait_time = self.rate_limiter.acquire(estimated_tokens)
 
                 if wait_time > 1:
@@ -117,11 +112,10 @@ class GraphService:
                 # Process batch
                 graph_docs = self._process_batch_with_retry(batch)
 
-                # Enrich relationships with source text for better visualization
+                # Enrich with descriptions and source tracking
                 self._enrich_graph_documents(graph_docs)
 
                 all_graph_docs.extend(graph_docs)
-
                 processed += len(batch)
 
                 if progress_callback:
@@ -167,14 +161,6 @@ class GraphService:
     ) -> dict:
         """
         Process documents using concurrent threads for higher throughput.
-
-        Args:
-            docs: List of document chunks to process
-            max_workers: Maximum concurrent processing threads
-            progress_callback: Optional callback for progress updates
-
-        Returns:
-            Processing statistics
         """
         max_workers = max_workers or config.MAX_CONCURRENT_LLM_CALLS
         batch_size = config.BATCH_SIZE_CHUNKS
@@ -182,7 +168,6 @@ class GraphService:
         if not docs:
             return {"chunks_processed": 0, "graph_documents": 0}
 
-        # Create batches
         batches = [docs[i : i + batch_size] for i in range(0, len(docs), batch_size)]
 
         all_graph_docs = []
@@ -194,22 +179,17 @@ class GraphService:
         )
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # Submit all batches
             future_to_batch = {
                 executor.submit(self._process_single_batch, batch): idx
                 for idx, batch in enumerate(batches)
             }
 
-            # Process completed batches
             for future in as_completed(future_to_batch):
                 batch_idx = future_to_batch[future]
 
                 try:
                     graph_docs = future.result()
-
-                    # Enrich relationships
                     self._enrich_graph_documents(graph_docs)
-
                     all_graph_docs.extend(graph_docs)
                     processed_batches += 1
 
@@ -242,16 +222,27 @@ class GraphService:
 
     def _process_single_batch(self, batch: List[Document]) -> List:
         """Process a single batch with rate limiting."""
-        # Acquire rate limit permission
         estimated_tokens = len(batch) * 2000
         self.rate_limiter.acquire(estimated_tokens)
-
-        # Process with retry
         return self._process_batch_with_retry(batch)
 
     def query_graph(self, question: str) -> str:
-        """Queries the knowledge graph."""
+        """Queries the knowledge graph using Cypher (legacy method)."""
         return self.neo4j_repo.query(question)
+
+    def query_graph_hybrid(self, question: str) -> dict:
+        """
+        Queries the knowledge graph using hybrid vector + graph approach.
+
+        Returns:
+            {
+                "answer": str,
+                "entities_found": List,
+                "graph_context": List,
+                "confidence": float
+            }
+        """
+        return self.neo4j_repo.query_hybrid(question)
 
     def prepare_database(self):
         """Prepare database for large-scale ingestion."""
@@ -260,21 +251,98 @@ class GraphService:
         print("✅ Database ready for ingestion")
 
     def _enrich_graph_documents(self, graph_documents: List):
-        """Adds source text and metadata to extracted relationships for better visualization."""
+        """
+        Enriches extracted graph documents with:
+        1. Source text and metadata on relationships
+        2. Description generation for nodes without descriptions
+        3. Confidence scores
+        """
         for g_doc in graph_documents:
-            source_text = (
-                g_doc.source.page_content
-                if hasattr(g_doc, "source") and hasattr(g_doc.source, "page_content")
-                else ""
-            )
-            source_id = (
-                g_doc.source.metadata.get("source", "unknown")
-                if hasattr(g_doc, "source") and hasattr(g_doc.source, "metadata")
-                else "unknown"
-            )
+            # Extract source info
+            source_text = ""
+            source_id = "unknown"
 
+            if hasattr(g_doc, "source") and g_doc.source:
+                if hasattr(g_doc.source, "page_content"):
+                    source_text = g_doc.source.page_content
+                if hasattr(g_doc.source, "metadata"):
+                    source_id = g_doc.source.metadata.get("source", "unknown")
+
+            # Enrich nodes with description if missing
+            for node in g_doc.nodes:
+                if not hasattr(node, "properties"):
+                    node.properties = {}
+
+                # Add source tracking
+                node.properties["source_document"] = source_id
+
+                # Generate description from source if not present
+                if not node.properties.get("description"):
+                    # Extract relevant context from source text
+                    description = self._extract_entity_description(node.id, source_text)
+                    if description:
+                        node.properties["description"] = description
+
+                # Add confidence score (could be enhanced with actual confidence)
+                if "confidence" not in node.properties:
+                    node.properties["confidence"] = 0.8
+
+            # Enrich relationships
             for rel in g_doc.relationships:
-                # Add source text and metadata to the relationship itself
-                # In the Neo4j Browser, clicking the relationship will now show these properties
-                rel.properties["source_chunk_text"] = source_text
+                if not hasattr(rel, "properties"):
+                    rel.properties = {}
+
+                rel.properties["source_chunk_text"] = (
+                    source_text[:500] if source_text else ""
+                )
                 rel.properties["source_file"] = source_id
+                rel.properties["extracted_at"] = self._get_timestamp()
+
+    def _extract_entity_description(
+        self, entity_name: str, source_text: str, max_length: int = 200
+    ) -> str:
+        """
+        Extract a description for an entity from the source text.
+
+        Uses simple heuristics:
+        1. Find sentences containing the entity name
+        2. Return the most relevant sentence as description
+        """
+        if not source_text or not entity_name:
+            return ""
+
+        # Normalize for matching
+        entity_lower = entity_name.lower()
+
+        # Split into sentences
+        sentences = source_text.replace("\n", " ").split(".")
+
+        # Find sentences mentioning the entity
+        relevant_sentences = []
+        for sentence in sentences:
+            if entity_lower in sentence.lower():
+                cleaned = sentence.strip()
+                if len(cleaned) > 20:  # Skip very short fragments
+                    relevant_sentences.append(cleaned)
+
+        if not relevant_sentences:
+            return ""
+
+        # Return the first/most relevant sentence, truncated
+        description = relevant_sentences[0]
+        if len(description) > max_length:
+            description = description[:max_length].rsplit(" ", 1)[0] + "..."
+
+        return description
+
+    def _get_timestamp(self) -> str:
+        """Get current ISO timestamp."""
+        from datetime import datetime
+
+        return datetime.utcnow().isoformat()
+
+    def get_extraction_stats(self) -> dict:
+        """Get statistics about the graph extraction process."""
+        return {
+            "rate_limiter": self.rate_limiter.get_stats() if self.rate_limiter else {}
+        }
