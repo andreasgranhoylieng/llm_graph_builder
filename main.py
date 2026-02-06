@@ -157,9 +157,12 @@ def main():
             print("=" * 50)
 
         elif choice == "7":
-            # Chat mode
+            # Chat mode with hybrid search
             print("\n💬 Chat Mode - Ask questions about your knowledge graph")
-            print("Type 'back' to return to menu\n")
+            print(
+                "Commands: 'back' = menu, 'explore <entity>' = show details, 'connect <a> to <b>' = find path"
+            )
+            print("Using hybrid vector + graph search for better results\n")
 
             while True:
                 q = input("You: ").strip()
@@ -168,8 +171,69 @@ def main():
                 if not q:
                     continue
 
-                answer = controller.chat(q)
-                print(f"\n🤖 Answer: {answer}\n")
+                # Handle special commands
+                if q.lower().startswith("explore "):
+                    entity_name = q[8:].strip()
+                    result = controller.explore_entity(entity_name)
+                    if result.get("entity"):
+                        print(
+                            f"\n📊 Entity: {result['entity'].get('name', entity_name)}"
+                        )
+                        print(f"   Labels: {result['entity'].get('labels', [])}")
+                        print(
+                            f"   Description: {result['entity'].get('description', 'N/A')}"
+                        )
+                        if result.get("neighbors"):
+                            print(
+                                f"\n🔗 Connected to {len(result['neighbors'])} entities:"
+                            )
+                            for n in result["neighbors"][:5]:
+                                print(f"   - {n.get('name', n.get('id', 'unknown'))}")
+                    else:
+                        print(f"\n❌ {result.get('message', 'Entity not found')}")
+                    print()
+                    continue
+
+                if q.lower().startswith("connect "):
+                    # Parse "connect A to B"
+                    parts = q[8:].split(" to ")
+                    if len(parts) == 2:
+                        result = controller.find_connections(
+                            parts[0].strip(), parts[1].strip()
+                        )
+                        if result.get("connected"):
+                            print(f"\n✅ Connection found ({result['hops']} hops):")
+                            print(f"   {result['description']}")
+                        else:
+                            print(
+                                f"\n❌ {result.get('description', 'No connection found')}"
+                            )
+                    else:
+                        print("Usage: connect <entity A> to <entity B>")
+                    print()
+                    continue
+
+                # Default: Use hybrid query
+                result = controller.chat_hybrid(q)
+
+                if "error" in result:
+                    print(f"\n❌ {result['error']}\n")
+                else:
+                    print(f"\n🤖 Answer: {result['answer']}")
+
+                    # Show sources if available
+                    if result.get("entities_found"):
+                        entities = result["entities_found"][:3]
+                        entity_names = [
+                            e.get("name") or e.get("id") or "?" for e in entities
+                        ]
+                        print(
+                            f"📌 Based on: {', '.join(str(n) for n in entity_names if n)}"
+                        )
+
+                    confidence = result.get("confidence", 0)
+                    method = result.get("method", "unknown")
+                    print(f"🎯 Confidence: {confidence:.0%} ({method})\n")
 
         elif choice == "8":
             # Legacy mode

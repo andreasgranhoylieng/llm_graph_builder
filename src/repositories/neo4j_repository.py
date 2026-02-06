@@ -252,7 +252,7 @@ class Neo4jRepository(INeo4jRepository):
         WHERE score >= $threshold
         RETURN 
             node.id as id,
-            node.name as name,
+            COALESCE(node.name, node.id) as name,
             node.description as description,
             labels(node) as labels,
             score
@@ -351,7 +351,7 @@ class Neo4jRepository(INeo4jRepository):
              [(start){path_pattern}(neighbor) | type(head(r))] as rel_types
         RETURN 
             neighbor.id as id,
-            neighbor.name as name,
+            COALESCE(neighbor.name, neighbor.id) as name,
             neighbor.description as description,
             labels(neighbor) as labels,
             rel_types[0] as relationship
@@ -376,7 +376,7 @@ class Neo4jRepository(INeo4jRepository):
             (start {{id: $start_id}})-[*1..{max_depth}]-(end {{id: $end_id}})
         )
         RETURN 
-            [n IN nodes(path) | {{id: n.id, name: n.name, labels: labels(n)}}] as nodes,
+            [n IN nodes(path) | {{id: n.id, name: COALESCE(n.name, n.id), labels: labels(n)}}] as nodes,
             [r IN relationships(path) | {{type: type(r), properties: properties(r)}}] as relationships
         """
 
@@ -405,7 +405,7 @@ class Neo4jRepository(INeo4jRepository):
         RETURN 
             [n IN nodes | {{
                 id: n.id, 
-                name: n.name, 
+                name: COALESCE(n.name, n.id), 
                 labels: labels(n),
                 description: n.description
             }}] as nodes,
@@ -435,7 +435,7 @@ class Neo4jRepository(INeo4jRepository):
         RETURN 
             collect(DISTINCT {{
                 id: connected.id,
-                name: connected.name,
+                name: COALESCE(connected.name, connected.id),
                 labels: labels(connected),
                 description: connected.description
             }}) as nodes
@@ -450,19 +450,23 @@ class Neo4jRepository(INeo4jRepository):
 
     def query_hybrid(self, question: str, top_k: int = 10) -> Dict[str, Any]:
         """
-        Hybrid query combining vector search and graph traversal.
+        Hybrid query combining vector search, document search, and graph traversal.
 
         Pipeline:
-        1. Vector search to find relevant entities
-        2. Expand graph context around found entities
-        3. Use LLM to synthesize answer from context
+        1. Vector search entities
+        2. Vector search document chunks
+        3. Expand graph context around found entities
+        4. Use LLM to synthesize answer from combined context
         """
         # Step 1: Vector search for relevant entities
         entities = self.vector_search(
             question, top_k=top_k, score_threshold=config.VECTOR_SEARCH_SCORE_THRESHOLD
         )
 
-        if not entities:
+        # Step 2: Also search document chunks for additional context
+        doc_chunks = self.vector_search_documents(question, top_k=5)
+
+        if not entities and not doc_chunks:
             # Fallback to pure Cypher query
             return {
                 "answer": self.query(question),
@@ -472,7 +476,7 @@ class Neo4jRepository(INeo4jRepository):
                 "method": "cypher_fallback",
             }
 
-        # Step 2: Expand graph context around top entities
+        # Step 3: Expand graph context around top entities
         graph_context = []
         for entity in entities[:3]:  # Top 3 entities
             neighbors = self.get_neighbors(
@@ -480,38 +484,54 @@ class Neo4jRepository(INeo4jRepository):
             )
             graph_context.extend(neighbors)
 
-        # Step 3: Build context for LLM
+        # Step 4: Build comprehensive context for LLM
         context_parts = []
 
+        # Add document chunk context (most relevant first!)
+        if doc_chunks:
+            context_parts.append("## Relevant Source Documents:")
+            for chunk in doc_chunks[:3]:
+                content = chunk.get("content", "")
+                if content:
+                    # Truncate very long chunks
+                    content = content[:800] + "..." if len(content) > 800 else content
+                    context_parts.append(f"```\n{content}\n```")
+
         # Add entity information
-        context_parts.append("## Relevant Entities Found:")
-        for ent in entities[:5]:
-            labels = ", ".join(ent.get("labels", []))
-            desc = ent.get("description", "No description")
-            context_parts.append(f"- **{ent['name']}** ({labels}): {desc}")
+        if entities:
+            context_parts.append("\n## Key Entities Found:")
+            for ent in entities[:5]:
+                labels = ", ".join(
+                    [l for l in ent.get("labels", []) if l != "__Entity__"]
+                )
+                desc = ent.get("description") or "No description available"
+                name = ent.get("name", ent.get("id", "Unknown"))
+                context_parts.append(f"- **{name}** ({labels}): {desc}")
 
         # Add relationship context
         if graph_context:
-            context_parts.append("\n## Related Entities:")
+            context_parts.append("\n## Connected Entities:")
             seen = set()
             for ctx in graph_context[:10]:
-                if ctx["id"] not in seen:
-                    seen.add(ctx["id"])
+                ctx_id = ctx.get("id")
+                if ctx_id and ctx_id not in seen:
+                    seen.add(ctx_id)
                     rel = ctx.get("relationship", "RELATED_TO")
-                    context_parts.append(f"- {ctx['name']} ({rel})")
+                    name = ctx.get("name", ctx_id)
+                    context_parts.append(f"- {name} ({rel})")
 
         context_str = "\n".join(context_parts)
 
-        # Step 4: Use LLM to synthesize answer
+        # Step 5: Use LLM to synthesize answer
         llm = ChatOpenAI(temperature=0, model_name=config.LLM_MODEL)
 
-        prompt = f"""Based on the following knowledge graph context, answer the question.
+        prompt = f"""Based on the following knowledge from a knowledge graph and source documents, answer the question.
 
 {context_str}
 
 Question: {question}
 
-Provide a clear, factual answer based only on the information above. If the information is insufficient, say so.
+Provide a clear, comprehensive answer based on the information above. Use the source documents for details and the entity information for key facts.
 
 Answer:"""
 
@@ -521,11 +541,20 @@ Answer:"""
         except Exception as e:
             answer = f"Error generating answer: {e}"
 
+        # Calculate confidence based on both entities and docs
+        if entities:
+            confidence = min(entities[0]["score"], 1.0)
+        elif doc_chunks:
+            confidence = min(doc_chunks[0].get("score", 0.5), 0.8)
+        else:
+            confidence = 0.3
+
         return {
             "answer": answer,
             "entities_found": entities,
             "graph_context": graph_context[:10],
-            "confidence": min(entities[0]["score"], 1.0) if entities else 0.0,
+            "doc_chunks_used": len(doc_chunks),
+            "confidence": confidence,
             "method": "hybrid",
         }
 
