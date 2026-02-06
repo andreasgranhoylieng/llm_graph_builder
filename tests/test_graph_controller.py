@@ -2,7 +2,6 @@
 Tests for GraphController - Integration tests for the controller layer.
 """
 
-import pytest
 from unittest.mock import MagicMock, patch
 from src.controllers.graph_controller import GraphController
 

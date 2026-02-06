@@ -6,7 +6,7 @@ import json
 import os
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional
 from src import config
 
 

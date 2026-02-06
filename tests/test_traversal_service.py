@@ -2,8 +2,7 @@
 Tests for TraversalService - Graph exploration and context extraction.
 """
 
-import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 from src.services.traversal_service import TraversalService
 
 

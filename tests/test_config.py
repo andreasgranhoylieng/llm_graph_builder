@@ -2,7 +2,6 @@
 Tests for configuration schema and validation.
 """
 
-import pytest
 from src import config
 
 

@@ -2,9 +2,7 @@
 Tests for GraphService - Graph extraction and document processing.
 """
 
-import pytest
 from unittest.mock import MagicMock, patch
-from langchain_core.documents import Document
 
 from src.services.graph_service import GraphService
 

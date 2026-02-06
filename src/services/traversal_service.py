@@ -2,9 +2,8 @@
 TraversalService - Advanced graph traversal and context extraction for RAG.
 """
 
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 from src.services.interfaces import INeo4jRepository, ITraversalService
-from src import config
 
 
 class TraversalService(ITraversalService):

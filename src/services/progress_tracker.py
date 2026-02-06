@@ -6,8 +6,8 @@ import os
 import sys
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
-from typing import Callable, Optional, List
+from datetime import datetime
+from typing import Callable, List
 from collections import deque
 
 
@@ -181,7 +181,7 @@ class ProgressTracker:
 
         print("=" * 60)
 
-        self._log(f"\n=== Processing Complete ===")
+        self._log("\n=== Processing Complete ===")
         self._log(f"Completed: {stats.completed_items}, Failed: {stats.failed_items}")
         self._log(f"Total time: {self._format_time(stats.elapsed_seconds)}")
 

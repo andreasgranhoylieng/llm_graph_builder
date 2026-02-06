@@ -5,7 +5,7 @@ and advanced querying capabilities.
 
 import os
 from datetime import datetime
-from typing import Optional, Dict, Any
+from typing import Dict, Any
 
 from src.services.ingest_service import IngestService
 from src.services.graph_service import GraphService
