@@ -10,6 +10,7 @@ from typing import Dict, Any
 from src.services.ingest_service import IngestService
 from src.services.graph_service import GraphService
 from src.services.traversal_service import TraversalService
+from src.services.agent_service import AgentService
 from src.services.progress_tracker import ChunkProgressTracker
 from src.repositories.file_repository import FileRepository
 from src.repositories.neo4j_repository import Neo4jRepository
@@ -28,6 +29,7 @@ class GraphController:
         self.ingest_service = IngestService(file_repo)
         self.graph_service = GraphService(neo4j_repo)
         self.traversal_service = TraversalService(neo4j_repo)
+        self.agent_service = AgentService(neo4j_repo, self.traversal_service)
         self.file_repo = file_repo
         self.neo4j_repo = neo4j_repo
         self.state_repo = ProcessingStateRepository()
@@ -79,6 +81,19 @@ class GraphController:
             return self.graph_service.query_graph_hybrid(question)
         except Exception as e:
             return {"error": f"Error during hybrid query: {str(e)}"}
+
+    def chat_agent(self, question: str) -> Dict[str, Any]:
+        """
+        Query using the Agentic approach (LangChain Agent).
+        This method uses a reasoning agent that can select tools dynamically.
+        """
+        if not question.strip():
+            return {"error": "Question cannot be empty."}
+
+        try:
+            return self.agent_service.ask(question)
+        except Exception as e:
+            return {"error": f"Error during agentic chat: {str(e)}"}
 
     def explore_entity(self, entity_name: str) -> Dict[str, Any]:
         """
