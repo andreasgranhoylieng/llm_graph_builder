@@ -163,61 +163,73 @@ class GraphService:
         Process documents using concurrent threads for higher throughput.
         """
         max_workers = max_workers or config.MAX_CONCURRENT_LLM_CALLS
-        batch_size = config.BATCH_SIZE_CHUNKS
+        batch_size = config.BATCH_SIZE_CHUNKS or 10
 
         if not docs:
             return {"chunks_processed": 0, "graph_documents": 0}
 
+        # Create batches
         batches = [docs[i : i + batch_size] for i in range(0, len(docs), batch_size)]
 
         all_graph_docs = []
-        processed_batches = 0
-        errors = 0
+        processed_chunks = 0
+        failed_chunks = 0
+
+        total_nodes = 0
+        total_relationships = 0
 
         print(
             f"🚀 Processing {len(docs)} chunks in {len(batches)} batches with {max_workers} workers..."
         )
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all batches
             future_to_batch = {
-                executor.submit(self._process_single_batch, batch): idx
-                for idx, batch in enumerate(batches)
+                executor.submit(self._process_single_batch, batch): batch
+                for batch in batches
             }
 
             for future in as_completed(future_to_batch):
-                batch_idx = future_to_batch[future]
+                batch = future_to_batch[future]
+                batch_len = len(batch)
 
                 try:
                     graph_docs = future.result()
-                    self._enrich_graph_documents(graph_docs)
-                    all_graph_docs.extend(graph_docs)
-                    processed_batches += 1
 
-                    if progress_callback:
-                        progress_callback(processed_batches, len(batches))
+                    # Enrich and save
+                    if graph_docs:
+                        self._enrich_graph_documents(graph_docs)
+
+                        # Save to Neo4j immediately
+                        # Verify connection first (handled in repo)
+                        print(
+                            f"💾 Saving {len(graph_docs)} graph documents to Neo4j..."
+                        )
+                        stats = self.neo4j_repo.add_graph_documents_batch(
+                            graph_docs, batch_size=100, include_source=True
+                        )
+                        total_nodes += stats.get("total_nodes", 0)
+                        total_relationships += stats.get("total_relationships", 0)
+                        all_graph_docs.extend(graph_docs)
+
+                    processed_chunks += batch_len
 
                 except Exception as e:
-                    print(f"⚠️ Batch {batch_idx} failed: {e}")
-                    errors += 1
+                    print(f"⚠️ Batch failed: {e}")
+                    failed_chunks += batch_len
 
-        # Save all results to Neo4j
-        if all_graph_docs:
-            print(f"💾 Saving {len(all_graph_docs)} graph documents to Neo4j...")
-            stats = self.neo4j_repo.add_graph_documents_batch(
-                all_graph_docs, batch_size=100, include_source=True
-            )
-        else:
-            stats = {"total_nodes": 0, "total_relationships": 0}
-
-        processed_chunks = sum(len(batches[i]) for i in range(processed_batches))
+                # Update progress
+                if progress_callback:
+                    # Callback expects (processed_count, total_count)
+                    progress_callback(processed_chunks + failed_chunks, len(docs))
 
         return {
             "chunks_processed": processed_chunks,
-            "batches_processed": processed_batches,
-            "batches_failed": errors,
+            "chunks_failed": failed_chunks,
+            "batches_processed": len(batches),
             "graph_documents": len(all_graph_docs),
-            "nodes_created": stats.get("total_nodes", 0),
-            "relationships_created": stats.get("total_relationships", 0),
+            "nodes_created": total_nodes,
+            "relationships_created": total_relationships,
         }
 
     def _process_single_batch(self, batch: List[Document]) -> List:

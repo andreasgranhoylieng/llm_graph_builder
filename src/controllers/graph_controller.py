@@ -271,8 +271,8 @@ class GraphController:
 
                     progress.set_file_chunks(len(chunks))
 
-                    # Build graph from chunks
-                    result = self.graph_service.build_graph_batch(
+                    # Build graph from chunks (Concurrent Mode)
+                    result = self.graph_service.build_graph_concurrent(
                         chunks,
                         progress_callback=lambda p, t: setattr(
                             progress,

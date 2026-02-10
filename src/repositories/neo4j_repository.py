@@ -107,6 +107,23 @@ class Neo4jRepository(INeo4jRepository):
             graph_documents, baseEntityLabel=True, include_source=include_source
         )
 
+    def verify_connectivity(self) -> bool:
+        """Verify Neo4j connection is active, recombining if necessary."""
+        try:
+            if self._graph:
+                self._graph.query("RETURN 1")
+                return True
+        except Exception:
+            # Force reconnection
+            self._graph = None
+
+        try:
+            self._get_graph()
+            return True
+        except Exception as e:
+            print(f"⚠️ Connection verification failed: {e}")
+            return False
+
     def add_graph_documents_batch(
         self, graph_documents: List, batch_size: int = 100, include_source: bool = True
     ) -> dict:
@@ -117,6 +134,8 @@ class Neo4jRepository(INeo4jRepository):
         1. Entity nodes (using name + description)
         2. Document chunks (using full content)
         """
+        # Ensure connection is alive before processing batch
+        self.verify_connectivity()
         graph = self._get_graph()
 
         total_nodes = 0
