@@ -214,8 +214,8 @@ def main():
                     print()
                     continue
 
-                # Default: Use hybrid query
-                result = controller.chat_hybrid(q)
+                # Agentic Chat (Clean Mode)
+                result = controller.chat_agent(q)
 
                 if "error" in result:
                     print(f"\n❌ {result['error']}\n")
@@ -223,18 +223,14 @@ def main():
                     print(f"\n🤖 Answer: {result['answer']}")
 
                     # Show sources if available
-                    if result.get("entities_found"):
-                        entities = result["entities_found"][:3]
-                        entity_names = [
-                            e.get("name") or e.get("id") or "?" for e in entities
-                        ]
-                        print(
-                            f"📌 Based on: {', '.join(str(n) for n in entity_names if n)}"
-                        )
-
-                    confidence = result.get("confidence", 0)
-                    method = result.get("method", "unknown")
-                    print(f"🎯 Confidence: {confidence:.0%} ({method})\n")
+                    if result.get("sources"):
+                        print("\n📚 Sources:")
+                        for source in result["sources"][:3]:
+                            content = source.get("content", "").strip()
+                            if len(content) > 100:
+                                content = content[:100] + "..."
+                            print(f"   - [{source.get('type', 'unknown')}] {content}")
+                    print()
 
         elif choice == "8":
             # Legacy mode
