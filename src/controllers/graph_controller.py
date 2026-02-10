@@ -95,6 +95,19 @@ class GraphController:
         except Exception as e:
             return {"error": f"Error during agentic chat: {str(e)}"}
 
+    def chat_with_logging(self, question: str) -> Dict[str, Any]:
+        """
+        Query using the Agentic approach with detailed execution logging.
+        Returns the answer along with a trace of the agent's steps.
+        """
+        if not question.strip():
+            return {"error": "Question cannot be empty."}
+
+        try:
+            return self.agent_service.ask(question, detailed_trace=True)
+        except Exception as e:
+            return {"error": f"Error during verbose chat: {str(e)}"}
+
     def explore_entity(self, entity_name: str) -> Dict[str, Any]:
         """
         Explore an entity and its context in the knowledge graph.
@@ -129,21 +142,16 @@ class GraphController:
         """
         try:
             # Find entity IDs via vector search
-            match_a = self.neo4j_repo.vector_search(
-                entity_a, top_k=1, score_threshold=0.6
-            )
-            match_b = self.neo4j_repo.vector_search(
-                entity_b, top_k=1, score_threshold=0.6
-            )
+            # Find entity IDs via robust resolution
+            match_a = self.traversal_service.resolve_entity(entity_a)
+            match_b = self.traversal_service.resolve_entity(entity_b)
 
             if not match_a:
                 return {"error": f"Entity '{entity_a}' not found."}
             if not match_b:
                 return {"error": f"Entity '{entity_b}' not found."}
 
-            return self.traversal_service.find_connections(
-                match_a[0]["id"], match_b[0]["id"]
-            )
+            return self.traversal_service.find_connections(match_a["id"], match_b["id"])
 
         except Exception as e:
             return {"error": f"Error finding connections: {str(e)}"}

@@ -2,7 +2,7 @@
 TraversalService - Advanced graph traversal and context extraction for RAG.
 """
 
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from src.services.interfaces import INeo4jRepository, ITraversalService
 
 
@@ -36,6 +36,12 @@ class TraversalService(ITraversalService):
         # Try to find direct path
         path = self.neo4j_repo.find_path(entity_a, entity_b, max_depth)
 
+        if not path:
+            # Fallback to BFS if shortest path fails (e.g. strict conditions or directionality)
+            print(f"Shortest path failed, trying BFS for {entity_a} -> {entity_b}...")
+            if hasattr(self.neo4j_repo, "bfs_search"):
+                path = self.neo4j_repo.bfs_search(entity_a, entity_b, max_depth)
+
         if path:
             # Build human-readable description, filtering out Document nodes
             description_parts = []
@@ -66,7 +72,7 @@ class TraversalService(ITraversalService):
                         rel_type = relationships[i].get("type", "RELATED_TO")
                         description_parts.append(f" --[{rel_type}]--> ")
                     else:
-                        description_parts.append(" --> ")
+                        description_parts.append(" --[CONNECTED_TO]--> ")
 
             return {
                 "connected": True,
@@ -337,3 +343,47 @@ class TraversalService(ITraversalService):
             return {"origin": entity_id, "descendants": results, "count": len(results)}
         except Exception as e:
             return {"origin": entity_id, "descendants": [], "count": 0, "error": str(e)}
+
+    def resolve_entity(self, name_or_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Resolve a name or ID to a valid entity node.
+        Prioritizes: Exact ID -> Exact Name -> Fuzzy Name -> Vector Search.
+        """
+        if not name_or_id:
+            return None
+
+        # 1. Check if it's already a valid ID
+        node = self.neo4j_repo.get_node_by_id(name_or_id)
+        if node:
+            return node
+
+        # 2. Check for exact/fuzzy name match
+        if hasattr(self.neo4j_repo, "find_node_by_name"):
+            node = self.neo4j_repo.find_node_by_name(name_or_id)
+            if node:
+                return node
+
+        # 3. Fallback to vector search
+        # Increase top_k to check for close comparisons
+        try:
+            results = self.neo4j_repo.vector_search(
+                name_or_id, top_k=3, score_threshold=0.5
+            )
+            if results:
+                # If the top result is very good, use it (score > 0.8)
+                if results[0]["score"] > 0.8:
+                    return results[0]
+
+                # Otherwise, check if any result name is a substring or superstring
+                name_lower = name_or_id.lower()
+                for res in results:
+                    res_name = res.get("name", "").lower()
+                    if name_lower in res_name or res_name in name_lower:
+                        return res
+
+                # Fallback to top result
+                return results[0]
+        except Exception as e:
+            print(f"Error during vector search resolution: {e}")
+
+        return None

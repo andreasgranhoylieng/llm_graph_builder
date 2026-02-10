@@ -204,3 +204,11 @@ class ITraversalService(ABC):
     ) -> List[Dict[str, Any]]:
         """Find entities similar to the given one."""
         pass
+
+    @abstractmethod
+    def resolve_entity(self, name_or_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Resolve a name or ID to a valid entity node.
+        Prioritizes: Exact ID -> Exact Name -> Fuzzy Name -> Vector Search.
+        """
+        pass

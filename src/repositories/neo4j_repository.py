@@ -339,6 +339,40 @@ class Neo4jRepository(INeo4jRepository):
             return node_data
         return None
 
+    def find_node_by_name(self, name: str) -> Optional[Dict[str, Any]]:
+        """
+        Find a node by exact or case-insensitive name match.
+        """
+        graph = self._get_graph()
+
+        # Try exact match first on name property
+        cypher_exact = """
+        MATCH (n)
+        WHERE n.name = $name
+        RETURN n, labels(n) as labels
+        LIMIT 1
+        """
+        results = graph.query(cypher_exact, params={"name": name})
+        if results:
+            node_data = dict(results[0]["n"])
+            node_data["labels"] = results[0]["labels"]
+            return node_data
+
+        # Try case-insensitive match
+        cypher_fuzzy = """
+        MATCH (n)
+        WHERE toLower(n.name) = toLower($name)
+        RETURN n, labels(n) as labels
+        LIMIT 1
+        """
+        results = graph.query(cypher_fuzzy, params={"name": name})
+        if results:
+            node_data = dict(results[0]["n"])
+            node_data["labels"] = results[0]["labels"]
+            return node_data
+
+        return None
+
     def get_neighbors(
         self,
         node_id: str,
@@ -410,7 +444,41 @@ class Neo4jRepository(INeo4jRepository):
                 }
             return None
         except Exception as e:
-            print(f"⚠️ Path finding failed: {e}")
+            print(f"Path finding failed: {e}")
+            return None
+
+    def bfs_search(
+        self, start_id: str, end_id: str, max_depth: int = 5
+    ) -> Optional[List[Dict[str, Any]]]:
+        """
+        Find ANY path between two nodes using Breadth-First Search (BFS).
+        Useful when shortestPath is too strict or fails.
+        """
+        graph = self._get_graph()
+
+        # Cypher doesn't have a direct "BFS" keyword but variable length paths
+        # without shortestPath use DFS/BFS depending on implementation.
+        # We can force a simple path check which usually finds *a* path.
+        cypher = f"""
+        MATCH path = (start {{id: $start_id}})-[*1..{max_depth}]-(end {{id: $end_id}})
+        RETURN 
+            [n IN nodes(path) | {{id: n.id, name: COALESCE(n.name, n.id), labels: labels(n)}}] as nodes,
+            [r IN relationships(path) | {{type: type(r), properties: properties(r)}}] as relationships
+        LIMIT 1
+        """
+
+        try:
+            results = graph.query(
+                cypher, params={"start_id": start_id, "end_id": end_id}
+            )
+            if results:
+                return {
+                    "nodes": results[0]["nodes"],
+                    "relationships": results[0]["relationships"],
+                }
+            return None
+        except Exception as e:
+            print(f"BFS search failed: {e}")
             return None
 
     def get_subgraph(self, center_id: str, max_depth: int = 2) -> Dict[str, Any]:

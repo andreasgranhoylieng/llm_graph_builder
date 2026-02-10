@@ -138,17 +138,17 @@ class AgentService:
         )  # Validation alias if needed, but we use _agent_graph separatey
 
     def _resolve_to_id(self, name_or_id: str) -> Optional[str]:
-        """Helper to resolve a name to an ID using vector search if needed."""
-        # Simple heuristic: if it has spaces, it's likely a name, not an ID
-        # But we'll just check if it exists directly first (TODO: Need a check_exists method)
+        """helper to resolve a name to an ID using exact match or vector search."""
+        if not name_or_id:
+            return None
 
-        # For now, just try vector search top 1
-        results = self.neo4j_repo.vector_search(name_or_id, top_k=1)
-        if results:
-            return results[0]["id"]
+        entity = self.traversal_service.resolve_entity(name_or_id)
+        if entity:
+            return entity["id"]
+
         return None
 
-    def ask(self, question: str) -> Dict[str, Any]:
+    def ask(self, question: str, detailed_trace: bool = False) -> Dict[str, Any]:
         """
         Run the agent to answer a question.
         Returns a dictionary with the answer and the thought process (intermediate steps).
@@ -196,10 +196,48 @@ class AgentService:
                             }
                         )  # Placeholder parsing
 
-            return {"answer": answer, "sources": sources, "status": "success"}
+            response = {"answer": answer, "sources": sources, "status": "success"}
+
+            if detailed_trace:
+                response["execution_trace"] = self._format_trace(messages)
+
+            return response
         except Exception as e:
             return {
                 "answer": f"I encountered an error while trying to answer that: {str(e)}",
                 "status": "error",
                 "error": str(e),
             }
+
+    def _format_trace(self, messages: list) -> list:
+        """
+        Format a list of LangChain messages into a readable execution trace.
+        """
+        trace = []
+        for i, msg in enumerate(messages):
+            step = {"step": i + 1, "type": msg.type}
+
+            if msg.type == "human":
+                step["content"] = f"Question: {msg.content}"
+            elif msg.type == "ai":
+                if msg.tool_calls:
+                    step["type"] = "thought_and_action"
+                    step["content"] = msg.content  # The thought process
+                    step["tool_calls"] = [
+                        {"name": tc["name"], "args": tc["args"]}
+                        for tc in msg.tool_calls
+                    ]
+                else:
+                    step["type"] = "answer"
+                    step["content"] = msg.content
+            elif msg.type == "tool":
+                step["type"] = "tool_result"
+                step["name"] = msg.name
+                # Truncate long tool outputs for readability
+                content = str(msg.content)
+                if len(content) > 500:
+                    content = content[:500] + "... (truncated)"
+                step["content"] = content
+
+            trace.append(step)
+        return trace

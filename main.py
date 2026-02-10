@@ -39,7 +39,8 @@ def print_menu():
     print("6. 💾 View Database Statistics")
     print("7. 💬 Chat with your Graph")
     print("8. ⚙️  Build Graph (Legacy Mode - Small Datasets)")
-    print("9. ❌ Exit")
+    print("9. 🕵️ Chat with detailed logging")
+    print("10. ❌ Exit")
 
 
 def get_folder_path() -> str:
@@ -56,7 +57,7 @@ def main():
 
     while True:
         print_menu()
-        choice = input("\nSelect an option (1-9): ").strip()
+        choice = input("\nSelect an option (1-10): ").strip()
 
         if choice == "1":
             # Batch processing mode
@@ -248,11 +249,50 @@ def main():
                 print(f"\n{result}")
 
         elif choice == "9":
+            # Detailed Logging Chat
+            print("\n" + "=" * 60)
+            print("🕵️ CHAT WITH DETAILED LOGGING")
+            print("=" * 60)
+            print("Type 'exit' or 'quit' to return to menu.")
+
+            while True:
+                question = input("\n📝 Ask a question: ").strip()
+
+                if question.lower() in ["exit", "quit"]:
+                    break
+
+                if not question:
+                    continue
+
+                print("⏳ Thinking and gathering logs...")
+                response = controller.chat_with_logging(question)
+
+                print(f"\n💡 Answer: {response.get('answer')}")
+
+                trace = response.get("execution_trace")
+                if trace:
+                    print(f"\n📜 Execution Trace ({len(trace)} steps):")
+                    for step in trace:
+                        print(f"  [{step['step']}] {step['type'].upper()}")
+                        if "tool_calls" in step:
+                            for tc in step["tool_calls"]:
+                                print(f"      🛠️ Tool: {tc['name']} -> {tc['args']}")
+                        if "content" in step:
+                            # Safely truncating content for display
+                            content = str(step["content"])
+                            if len(content) > 200:
+                                content = content[:200] + "..."
+                            print(f"      📝 {content}")
+
+                if "error" in response:
+                    print(f"❌ Error: {response['error']}")
+
+        elif choice == "10":
             print("\n👋 Goodbye!")
             sys.exit(0)
 
         else:
-            print("❌ Invalid choice. Please select 1-9.")
+            print("❌ Invalid choice. Please select 1-10.")
 
 
 if __name__ == "__main__":
