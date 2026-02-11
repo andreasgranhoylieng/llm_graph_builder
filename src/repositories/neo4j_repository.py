@@ -4,6 +4,7 @@ Enhanced with SOTA GraphRAG: bidirectional BFS, parallel multi-source BFS, graph
 """
 
 import hashlib
+import re
 from typing import List, Dict, Any, Optional, Set
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from langchain_neo4j import Neo4jGraph, GraphCypherQAChain
@@ -441,6 +442,9 @@ class Neo4jRepository(INeo4jRepository):
                 WHEN size(content_keys) > 0 THEN toString(node[content_keys[0]])
                 ELSE ''
             END as content,
+            toString(COALESCE(node.source_file, node.source, '')) as source_file,
+            toString(COALESCE(node.source_path, '')) as source_path,
+            COALESCE(toInteger(node.page), -1) as page,
             score
         ORDER BY score DESC
         """
@@ -993,35 +997,70 @@ class Neo4jRepository(INeo4jRepository):
     # HYBRID QUERY
     # =========================================================================
 
-    def query_hybrid(self, question: str, top_k: int = 10) -> Dict[str, Any]:
+    def _decompose_question(self, question: str) -> List[str]:
         """
-        SOTA Hybrid query combining vector search, parallel BFS expansion,
-        graph-aware reranking, and LLM synthesis.
+        Split compound prompts into independent sub-questions.
 
-        Pipeline:
-        1. RETRIEVE  - Vector search entities + document chunks
-        2. EXPAND    - Parallel BFS from top-K entity seeds
-        3. RERANK    - Blend vector similarity with graph proximity
-        4. SYNTHESIZE - Feed reranked, expanded context to LLM
+        This improves retrieval for mixed-topic prompts like:
+        "How much did X invest ... and what is the best model of Y?"
         """
-        # === Stage 1: RETRIEVE ===
+        max_sub_questions = 15
+        normalized = " ".join((question or "").split())
+        if not normalized:
+            return []
+
+        def _normalize_segment(segment: str) -> str:
+            cleaned = segment.strip(" ,.;")
+            cleaned = re.sub(
+                r"^(and|also|plus|then)\s+",
+                "",
+                cleaned,
+                flags=re.IGNORECASE,
+            )
+            return cleaned.strip(" ,.;")
+
+        # Explicit multi-question punctuation takes priority.
+        if normalized.count("?") > 1:
+            parts = []
+            for segment in re.split(r"\?\s*", normalized):
+                clean = _normalize_segment(segment)
+                if clean:
+                    parts.append(clean if clean.endswith("?") else f"{clean}?")
+            return parts[:max_sub_questions] if len(parts) > 1 else [normalized]
+
+        # Split on coordination when a new interrogative clause follows.
+        split_pattern = re.compile(
+            r"\s+(?:and|also|plus|then)\s+(?=(?:what|which|who|how|when|where|why|is|are|do|does|did|can|could|should|would|for)\b)",
+            flags=re.IGNORECASE,
+        )
+        candidates = [
+            _normalize_segment(segment)
+            for segment in split_pattern.split(normalized)
+            if _normalize_segment(segment)
+        ]
+
+        if len(candidates) <= 1:
+            return [normalized]
+
+        deduped: List[str] = []
+        seen = set()
+        for candidate in candidates:
+            key = candidate.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(candidate)
+
+        return deduped[:max_sub_questions] if deduped else [normalized]
+
+    def _retrieve_hybrid_context(self, question: str, top_k: int = 10) -> Dict[str, Any]:
+        """Run retrieval/expansion/reranking for one question segment."""
         entities = self.vector_search(
             question, top_k=top_k, score_threshold=config.VECTOR_SEARCH_SCORE_THRESHOLD
         )
         doc_chunks = self.vector_search_documents(question, top_k=5)
 
-        if not entities and not doc_chunks:
-            return {
-                "answer": self.query(question),
-                "entities_found": [],
-                "graph_context": [],
-                "bridge_nodes": [],
-                "confidence": 0.3,
-                "method": "cypher_fallback",
-            }
-
-        # === Stage 2: EXPAND via parallel BFS ===
-        seed_ids = [e["id"] for e in entities[:5] if e.get("id")]  # Top 5 as seeds
+        seed_ids = [e["id"] for e in entities[:5] if e.get("id")]
         expanded_subgraph = {"nodes": [], "relationships": [], "bridge_nodes": []}
 
         if seed_ids:
@@ -1031,14 +1070,12 @@ class Neo4jRepository(INeo4jRepository):
                 )
             except Exception as e:
                 print(f"Parallel BFS expansion failed, falling back to neighbors: {e}")
-                # Fallback to simple neighbor expansion
                 for entity in entities[:3]:
                     neighbors = self.get_neighbors(
                         entity["id"], depth=config.HYBRID_SEARCH_DEPTH
                     )
                     expanded_subgraph["nodes"].extend(neighbors)
 
-        # === Stage 3: RERANK with graph proximity ===
         if entities and seed_ids:
             try:
                 entities = self.graph_rerank(
@@ -1050,17 +1087,187 @@ class Neo4jRepository(INeo4jRepository):
             except Exception as e:
                 print(f"Graph reranking failed, using vector-only ranking: {e}")
 
+        return {
+            "question": question,
+            "entities": entities,
+            "doc_chunks": doc_chunks,
+            "expanded_subgraph": expanded_subgraph,
+        }
+
+    def _merge_entities(
+        self, grouped_entities: List[List[Dict[str, Any]]]
+    ) -> List[Dict[str, Any]]:
+        """Merge and deduplicate entities while preserving the strongest match."""
+        merged: Dict[str, Dict[str, Any]] = {}
+
+        for entities in grouped_entities:
+            for entity in entities:
+                entity_id = entity.get("id") or entity.get("name")
+                if not entity_id:
+                    continue
+
+                key = str(entity_id)
+                candidate = dict(entity)
+                existing = merged.get(key)
+
+                if existing is None:
+                    merged[key] = candidate
+                    continue
+
+                if candidate.get("score", 0) > existing.get("score", 0):
+                    merged[key] = candidate
+                    continue
+
+                if not existing.get("description") and candidate.get("description"):
+                    existing["description"] = candidate["description"]
+                if (
+                    existing.get("graph_proximity") is None
+                    and candidate.get("graph_proximity") is not None
+                ):
+                    existing["graph_proximity"] = candidate["graph_proximity"]
+                if not existing.get("labels") and candidate.get("labels"):
+                    existing["labels"] = candidate["labels"]
+
+        return sorted(merged.values(), key=lambda item: item.get("score", 0), reverse=True)
+
+    def _merge_doc_chunks(
+        self, grouped_chunks: List[List[Dict[str, Any]]], max_chunks: int
+    ) -> List[Dict[str, Any]]:
+        """Merge and deduplicate document chunks by chunk id/content."""
+        merged: Dict[str, Dict[str, Any]] = {}
+
+        for chunks in grouped_chunks:
+            for chunk in chunks:
+                chunk_id = chunk.get("id")
+                if not chunk_id:
+                    content = str(chunk.get("content", ""))
+                    content_hash = hashlib.md5(content.encode("utf-8")).hexdigest()[:16]
+                    chunk_id = f"content:{content_hash}"
+                key = str(chunk_id)
+
+                existing = merged.get(key)
+                if (
+                    existing is None
+                    or chunk.get("score", 0) > existing.get("score", 0)
+                ):
+                    merged[key] = dict(chunk)
+
+        deduped = sorted(merged.values(), key=lambda item: item.get("score", 0), reverse=True)
+        return deduped[:max_chunks]
+
+    def _merge_expanded_subgraphs(
+        self, subgraphs: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """Merge nodes/relationships/bridge nodes from multiple expansions."""
+        nodes_by_id: Dict[str, Dict[str, Any]] = {}
+        relationships_by_key: Dict[str, Dict[str, Any]] = {}
+        bridge_by_id: Dict[str, Dict[str, Any]] = {}
+
+        for subgraph in subgraphs:
+            for node in subgraph.get("nodes", []) or []:
+                node_id = node.get("id")
+                if not node_id:
+                    continue
+                nodes_by_id.setdefault(str(node_id), dict(node))
+
+            for bridge in subgraph.get("bridge_nodes", []) or []:
+                bridge_id = bridge.get("id")
+                if not bridge_id:
+                    continue
+                bridge_by_id.setdefault(str(bridge_id), dict(bridge))
+
+            for rel in subgraph.get("relationships", []) or []:
+                start = rel.get("start", "")
+                rel_type = rel.get("type", "RELATED_TO")
+                end = rel.get("end", "")
+                key = f"{start}|{rel_type}|{end}"
+                if key not in relationships_by_key:
+                    relationships_by_key[key] = dict(rel)
+
+        return {
+            "nodes": list(nodes_by_id.values()),
+            "relationships": list(relationships_by_key.values()),
+            "bridge_nodes": list(bridge_by_id.values()),
+        }
+
+    def _format_chunk_source(self, chunk: Dict[str, Any]) -> str:
+        """Create a human-readable source label for a document chunk."""
+        source_name = chunk.get("source_file") or chunk.get("source_path") or chunk.get("id")
+        page = chunk.get("page", -1)
+        if isinstance(page, int) and page >= 0:
+            return f"{source_name} p.{page + 1}"
+        return str(source_name)
+
+    def query_hybrid(self, question: str, top_k: int = 10) -> Dict[str, Any]:
+        """
+        SOTA Hybrid query combining vector search, parallel BFS expansion,
+        graph-aware reranking, and LLM synthesis.
+
+        Pipeline:
+        1. RETRIEVE  - Vector search entities + document chunks
+        2. EXPAND    - Parallel BFS from top-K entity seeds
+        3. RERANK    - Blend vector similarity with graph proximity
+        4. SYNTHESIZE - Feed reranked, expanded context to LLM
+        """
+        sub_questions = self._decompose_question(question)
+        contexts = [
+            self._retrieve_hybrid_context(sub_question, top_k=top_k)
+            for sub_question in sub_questions
+        ]
+        contexts_with_hits = [
+            ctx for ctx in contexts if ctx.get("entities") or ctx.get("doc_chunks")
+        ]
+
+        if not contexts_with_hits:
+            return {
+                "answer": self.query(question),
+                "entities_found": [],
+                "graph_context": [],
+                "bridge_nodes": [],
+                "sub_questions": sub_questions,
+                "sub_question_coverage": 0.0,
+                "confidence": 0.3,
+                "method": "cypher_fallback",
+            }
+
+        entities = self._merge_entities(
+            [ctx.get("entities", []) for ctx in contexts_with_hits]
+        )
+        doc_chunk_budget = (
+            min(15, max(5, len(sub_questions) * 2)) if len(sub_questions) > 1 else 5
+        )
+        doc_chunks = self._merge_doc_chunks(
+            [ctx.get("doc_chunks", []) for ctx in contexts_with_hits],
+            max_chunks=doc_chunk_budget,
+        )
+        expanded_subgraph = self._merge_expanded_subgraphs(
+            [ctx.get("expanded_subgraph", {}) for ctx in contexts_with_hits]
+        )
+        sub_question_coverage = len(contexts_with_hits) / max(len(sub_questions), 1)
+
         # === Stage 4: SYNTHESIZE ===
         context_parts = []
+
+        if len(sub_questions) > 1:
+            context_parts.append("## Decomposed Sub-Questions:")
+            for index, sub_question in enumerate(sub_questions, start=1):
+                context_parts.append(f"{index}. {sub_question}")
 
         # Document chunks (highest fidelity source)
         if doc_chunks:
             context_parts.append("## Relevant Source Documents:")
-            for chunk in doc_chunks[:3]:
+            doc_limit = min(len(doc_chunks), max(3, len(sub_questions) * 2))
+            content_limit = 500 if len(sub_questions) >= 4 else 800
+            for chunk in doc_chunks[:doc_limit]:
                 content = chunk.get("content", "")
                 if content:
-                    content = content[:800] + "..." if len(content) > 800 else content
-                    context_parts.append(f"```\n{content}\n```")
+                    content = (
+                        content[:content_limit] + "..."
+                        if len(content) > content_limit
+                        else content
+                    )
+                    source = self._format_chunk_source(chunk)
+                    context_parts.append(f"Source: {source}\n```\n{content}\n```")
 
         # Reranked entity context
         if entities:
@@ -1130,7 +1337,7 @@ class Neo4jRepository(INeo4jRepository):
         # LLM synthesis
         llm = ChatOpenAI(temperature=0, model_name=config.LLM_MODEL)
 
-        prompt = f"""Based on the following knowledge from a knowledge graph and source documents, answer the question.
+        prompt = f"""Based on the following knowledge from a knowledge graph and source documents, answer the user's question.
 
 The information includes:
 - Source documents (raw text from original files)
@@ -1143,7 +1350,11 @@ The information includes:
 
 Question: {question}
 
-Provide a clear, comprehensive answer. Prioritize information from source documents for details and use the knowledge graph structure for understanding relationships and connections. If bridge entities are relevant, explain how they connect the topics.
+Instructions:
+- If the question contains multiple parts, answer each part explicitly in a numbered list.
+- Prefer exact numeric values from source documents when available.
+- Include source attribution like "(source: SpaceX.pdf p.5)" for key facts when possible.
+- If a part of the question is not grounded in retrieved evidence, state that clearly.
 
 Answer:"""
 
@@ -1155,19 +1366,18 @@ Answer:"""
             llm_failed = True
             answer = f"Error generating answer: {e}"
 
-        # Confidence: blend of vector score, graph proximity, and doc coverage
-        if entities:
-            top_score = entities[0].get("score", 0)
-            has_bridges = len(bridge_nodes) > 0
-            has_docs = len(doc_chunks) > 0
-            confidence = min(
-                top_score * (1.1 if has_bridges else 1.0) * (1.1 if has_docs else 1.0),
-                1.0,
-            )
-        elif doc_chunks:
-            confidence = min(doc_chunks[0].get("score", 0.5), 0.8)
-        else:
-            confidence = 0.3
+        # Confidence: blend vector relevance, document relevance, and multi-part coverage.
+        top_entity_score = entities[0].get("score", 0) if entities else 0
+        top_doc_score = doc_chunks[0].get("score", 0) if doc_chunks else 0
+        confidence = (
+            0.6 * top_entity_score + 0.3 * top_doc_score + 0.1 * sub_question_coverage
+        )
+
+        if not entities and doc_chunks:
+            confidence = min(max(top_doc_score, 0.4) * sub_question_coverage, 0.85)
+
+        if bridge_nodes:
+            confidence = min(confidence * 1.05, 1.0)
 
         if llm_failed:
             confidence = min(confidence, 0.2)
@@ -1178,6 +1388,8 @@ Answer:"""
             "graph_context": expanded_nodes[:10],
             "bridge_nodes": bridge_nodes,
             "doc_chunks_used": len(doc_chunks),
+            "sub_questions": sub_questions,
+            "sub_question_coverage": round(sub_question_coverage, 3),
             "confidence": round(confidence, 3),
             "method": "hybrid_sota",
             "status": "error" if llm_failed else "success",

@@ -226,6 +226,20 @@ class TestGraphTraversal:
 class TestHybridQuery:
     """Tests for hybrid query functionality."""
 
+    def test_decompose_question_supports_more_than_five_sub_questions(self):
+        """Compound prompts should decompose into all detected sub-questions up to the cap."""
+        repo = Neo4jRepository()
+        question = (
+            "How much did Google invest in SpaceX and for how much ownership, "
+            "and what model of Claude is best and who created Claude "
+            "and when was Claude released and where is Anthropic based?"
+        )
+
+        parts = repo._decompose_question(question)
+
+        assert len(parts) == 6
+        assert not any(part.lower().startswith("and ") for part in parts)
+
     def test_hybrid_query_with_matches(
         self, mock_neo4j_graph, mock_embeddings, sample_entities, sample_neighbors
     ):
