@@ -107,11 +107,104 @@ class AgentService:
                 output.append(f"Content: {content}")
             return "\n\n".join(output)
 
+        @tool
+        def explore_neighborhood(entity_id: str, depth: int = 2) -> str:
+            """
+            Explore the multi-hop neighborhood around an entity.
+            Returns a structured view including relationship chains and connected entities.
+            Use this for deep exploration of an entity's context beyond just direct neighbors.
+            Use depth=2 for moderate exploration, depth=3 for deep exploration.
+            """
+            context = self.traversal_service.get_entity_context(entity_id)
+            if not context.get("entity"):
+                return f"Entity with ID '{entity_id}' not found."
+
+            summary = context.get("context_summary", "")
+
+            # Also get expanded subgraph via parallel BFS
+            try:
+                expanded = self.neo4j_repo.parallel_bfs_from_seeds(
+                    [entity_id], max_depth=depth
+                )
+                node_count = len(expanded.get("nodes", []))
+                rel_count = len(expanded.get("relationships", []))
+
+                output_parts = [
+                    summary,
+                    f"\nExpanded neighborhood: {node_count} nodes, {rel_count} relationships",
+                ]
+
+                # Add relationship chains
+                rels = expanded.get("relationships", [])[:10]
+                if rels:
+                    output_parts.append("\nRelationship chains:")
+                    for rel in rels:
+                        start = rel.get("start", "?")
+                        end = rel.get("end", "?")
+                        rel_type = rel.get("type", "RELATED_TO")
+                        output_parts.append(f"  {start} --[{rel_type}]--> {end}")
+
+                return "\n".join(output_parts)
+            except Exception:
+                return summary
+
+        @tool
+        def multi_hop_search(entity_names: str) -> str:
+            """
+            Find connections between multiple entities by running parallel graph search.
+            Input should be comma-separated entity names.
+            This finds bridge entities that connect the topics and shows how they relate.
+            Example input: "GPT-4, RLHF, Anthropic"
+            """
+            names = [n.strip() for n in entity_names.split(",") if n.strip()]
+            if len(names) < 2:
+                return "Please provide at least 2 comma-separated entity names."
+
+            # Resolve all names to IDs
+            entity_ids = []
+            resolved = []
+            for name in names:
+                eid = self._resolve_to_id(name)
+                if eid:
+                    entity_ids.append(eid)
+                    resolved.append(f"{name} -> {eid}")
+
+            if len(entity_ids) < 2:
+                return f"Could only resolve {len(entity_ids)} of {len(names)} entities. Resolved: {'; '.join(resolved)}"
+
+            # Get multi-entity context via parallel BFS
+            try:
+                result = self.traversal_service.get_multi_entity_context(entity_ids)
+                output_parts = [f"Resolved: {'; '.join(resolved)}"]
+                output_parts.append(result.get("context_summary", ""))
+
+                # Show bridge nodes
+                bridges = result.get("bridge_nodes", [])
+                if bridges:
+                    output_parts.append("\nBridge entities connecting them:")
+                    for b in bridges[:5]:
+                        name = b.get("name", b.get("id", "?"))
+                        desc = b.get("description", "")
+                        output_parts.append(f"  - {name}: {desc}")
+
+                # Show key relationship chains
+                chains = result.get("relationship_chains", [])
+                if chains:
+                    output_parts.append("\nKey relationship chains:")
+                    for chain in chains[:10]:
+                        output_parts.append(f"  {chain}")
+
+                return "\n".join(output_parts)
+            except Exception as e:
+                return f"Multi-hop search failed: {e}"
+
         tools = [
             search_vector_store,
             get_entity_context,
             find_connections,
             search_documents,
+            explore_neighborhood,
+            multi_hop_search,
         ]
 
         # Create Agent (LangGraph based)
@@ -122,14 +215,24 @@ class AgentService:
             
             Your goal is to answer the user's question by gathering information from the graph.
             
-            GUIDELINES:
-            1. ERROR HANDLING: If you search for an entity and don't find it, try a different variation of the name or use `search_vector_store` again with a broader query.
-            2. ID USAGE: The tools often require specific Entity IDs. Use `search_vector_store` to find the correct ID and Name for an entity first.
-            3. MULTI-STEP REASONING: 
-               - If asked about "Model A", first find "Model A".
-               - Then look at its context or specific relationships.
-            4. CITATIONS: When you find information, mention the source nodes or relationships.
+            AVAILABLE TOOLS (use strategically):
+            1. `search_vector_store` - Find entities by semantic similarity. Start here for discovery.
+            2. `get_entity_context` - Get details about a single entity and its direct neighbors.
+            3. `find_connections` - Find the shortest path between exactly 2 entities.
+            4. `search_documents` - Search original source documents for raw text details.
+            5. `explore_neighborhood` - Deep multi-hop exploration around one entity. Use for "tell me about X" questions.
+            6. `multi_hop_search` - Find connections across 2+ entities simultaneously. Use for "how are X, Y, and Z related?" questions.
             
+            STRATEGY GUIDELINES:
+            - For "what is X?" -> search_vector_store + get_entity_context
+            - For "how is X related to Y?" -> find_connections or multi_hop_search  
+            - For "tell me everything about X" -> explore_neighborhood with depth=3
+            - For "how are X, Y, Z connected?" -> multi_hop_search with all names
+            - For specific facts or quotes -> search_documents
+            - When one tool returns names, use them with other tools to dig deeper
+            
+            ERROR HANDLING: If you search for an entity and don't find it, try variations of the name or broader queries.
+            CITATIONS: Mention source nodes or relationships when providing information.
             Do not guess. If you cannot find the answer in the graph or documents, say so.
             """,
         )

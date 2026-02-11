@@ -244,3 +244,12 @@ ENABLE_DETAILED_LOGGING = True
 VECTOR_SEARCH_TOP_K = 30
 VECTOR_SEARCH_SCORE_THRESHOLD = 0.7
 HYBRID_SEARCH_DEPTH = 10  # Hops for graph expansion after vector search
+
+# =============================================================================
+# SOTA GRAPH RAG CONFIGURATION
+# =============================================================================
+MAX_PARALLEL_BFS_WORKERS = 3  # Concurrent BFS threads for multi-source search
+BFS_MAX_DEPTH = 4  # Max hops for BFS traversals
+RERANK_VECTOR_WEIGHT = 0.6  # Weight for vector similarity in reranking
+RERANK_GRAPH_WEIGHT = 0.4  # Weight for graph proximity in reranking
+MULTI_HOP_CONTEXT_DEPTH = 3  # Depth for multi-hop context extraction

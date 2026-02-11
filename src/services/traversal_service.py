@@ -387,3 +387,94 @@ class TraversalService(ITraversalService):
             print(f"Error during vector search resolution: {e}")
 
         return None
+
+    def get_multi_entity_context(
+        self, entity_ids: List[str], max_depth: int = 3
+    ) -> Dict[str, Any]:
+        """
+        Get aggregated context from multiple entities via parallel BFS.
+
+        This is a SOTA method that:
+        1. Expands subgraphs from all entities concurrently
+        2. Identifies bridge nodes connecting the entities
+        3. Builds relationship chain narratives
+
+        Args:
+            entity_ids: List of entity IDs to get context for
+            max_depth: How far to expand from each entity
+
+        Returns:
+            {
+                "entities": list of entity details,
+                "bridge_nodes": nodes connecting multiple entities,
+                "relationship_chains": human-readable relationship descriptions,
+                "merged_context": full merged subgraph,
+                "context_summary": human-readable summary
+            }
+        """
+        if not entity_ids:
+            return {
+                "entities": [],
+                "bridge_nodes": [],
+                "relationship_chains": [],
+                "merged_context": {"nodes": [], "relationships": []},
+                "context_summary": "No entities provided.",
+            }
+
+        # Get individual entity details
+        entities = []
+        for eid in entity_ids:
+            entity = self.neo4j_repo.get_node_by_id(eid)
+            if entity:
+                entities.append(entity)
+
+        if not entities:
+            return {
+                "entities": [],
+                "bridge_nodes": [],
+                "relationship_chains": [],
+                "merged_context": {"nodes": [], "relationships": []},
+                "context_summary": "None of the provided entities were found.",
+            }
+
+        # Parallel BFS expansion from all entities
+        merged = self.neo4j_repo.parallel_bfs_from_seeds(entity_ids, max_depth)
+        bridge_nodes = merged.get("bridge_nodes", [])
+
+        # Build relationship chain narratives
+        relationship_chains = []
+        for rel in merged.get("relationships", []):
+            start = rel.get("start", "?")
+            end = rel.get("end", "?")
+            rel_type = rel.get("type", "RELATED_TO")
+            chain = f"{start} --[{rel_type}]--> {end}"
+            relationship_chains.append(chain)
+
+        # Build context summary
+        entity_names = [e.get("name", e.get("id", "?")) for e in entities]
+        summary_parts = [
+            f"Context for {len(entities)} entities: {', '.join(entity_names)}",
+        ]
+
+        if bridge_nodes:
+            bridge_names = [b.get("name", b.get("id", "?")) for b in bridge_nodes[:5]]
+            summary_parts.append(
+                f"Bridge nodes connecting them: {', '.join(bridge_names)}"
+            )
+
+        total_nodes = len(merged.get("nodes", []))
+        total_rels = len(merged.get("relationships", []))
+        summary_parts.append(
+            f"Expanded subgraph contains {total_nodes} nodes and {total_rels} relationships."
+        )
+
+        return {
+            "entities": entities,
+            "bridge_nodes": bridge_nodes,
+            "relationship_chains": relationship_chains[:20],
+            "merged_context": {
+                "nodes": merged.get("nodes", []),
+                "relationships": merged.get("relationships", []),
+            },
+            "context_summary": "\n".join(summary_parts),
+        }

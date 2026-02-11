@@ -182,6 +182,24 @@ class INeo4jRepository(ABC):
         """Execute a raw Cypher query (for advanced use cases)."""
         pass
 
+    @abstractmethod
+    def parallel_bfs_from_seeds(
+        self, seed_ids: List[str], max_depth: int = 3
+    ) -> Dict[str, Any]:
+        """Launch parallel BFS from multiple seed nodes, merge results."""
+        pass
+
+    @abstractmethod
+    def graph_rerank(
+        self,
+        entities: List[Dict[str, Any]],
+        query_entity_ids: List[str],
+        vector_weight: float = 0.6,
+        graph_weight: float = 0.4,
+    ) -> List[Dict[str, Any]]:
+        """Rerank entity results by graph proximity to query entities."""
+        pass
+
 
 class ITraversalService(ABC):
     """Interface for advanced graph traversal operations."""
@@ -210,5 +228,15 @@ class ITraversalService(ABC):
         """
         Resolve a name or ID to a valid entity node.
         Prioritizes: Exact ID -> Exact Name -> Fuzzy Name -> Vector Search.
+        """
+        pass
+
+    @abstractmethod
+    def get_multi_entity_context(
+        self, entity_ids: List[str], max_depth: int = 3
+    ) -> Dict[str, Any]:
+        """
+        Get aggregated context from multiple entities via parallel BFS.
+        Returns merged subgraph with bridge nodes identified.
         """
         pass

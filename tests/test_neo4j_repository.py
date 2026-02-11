@@ -186,11 +186,55 @@ class TestHybridQuery:
 
             # First call returns entities (vector search)
             # Second call returns neighbors
+            # vector search returns entities, doc search returns [],
+            # then parallel BFS seed expansions and reranking queries follow
             mock_neo4j_graph.query.side_effect = [
                 sample_entities,  # vector search
-                sample_neighbors,  # neighbors for entity 1
-                sample_neighbors,  # neighbors for entity 2
-                sample_neighbors,  # neighbors for entity 3
+                [],  # document search
+                Exception("APOC"),  # seed 1 APOC attempt
+                [
+                    {
+                        "nodes": [
+                            {
+                                "id": "GPT-4",
+                                "name": "GPT-4",
+                                "labels": ["AIModel"],
+                                "description": "",
+                            }
+                        ]
+                    }
+                ],  # seed 1 fallback
+                Exception("APOC"),  # seed 2 APOC attempt
+                [
+                    {
+                        "nodes": [
+                            {
+                                "id": "GPT-3.5",
+                                "name": "GPT-3.5",
+                                "labels": ["AIModel"],
+                                "description": "",
+                            }
+                        ]
+                    }
+                ],  # seed 2 fallback
+                Exception("APOC"),  # seed 3 APOC attempt
+                [
+                    {
+                        "nodes": [
+                            {
+                                "id": "Claude-3",
+                                "name": "Claude-3",
+                                "labels": ["AIModel"],
+                                "description": "",
+                            }
+                        ]
+                    }
+                ],  # seed 3 fallback
+                [
+                    {"eid": "GPT-4", "min_distance": 0},
+                    {"eid": "GPT-3.5", "min_distance": 1},
+                    {"eid": "Claude-3", "min_distance": 2},
+                ],  # reranking
             ]
 
             mock_embeddings.embed_query.return_value = [0.1] * 3072
@@ -206,7 +250,7 @@ class TestHybridQuery:
 
             assert "answer" in result
             assert "entities_found" in result
-            assert result["method"] == "hybrid"
+            assert result["method"] == "hybrid_sota"
 
     def test_hybrid_query_falls_back_to_cypher(self, mock_neo4j_graph, mock_embeddings):
         """Test hybrid query falls back to Cypher when no vector matches."""
@@ -307,3 +351,274 @@ class TestDatabaseManagement:
                 repo.clear_database(confirm=False)
 
             assert "confirm=True" in str(exc_info.value)
+
+
+class TestBidirectionalBFS:
+    """Tests for the SOTA bidirectional BFS implementation."""
+
+    def test_bfs_finds_path_via_apoc(self, mock_neo4j_graph):
+        """Test that APOC-based BFS returns a path when available."""
+        with patch("src.repositories.neo4j_repository.Neo4jGraph") as neo4j_mock:
+            neo4j_mock.return_value = mock_neo4j_graph
+            mock_neo4j_graph.query.return_value = [
+                {
+                    "nodes": [
+                        {"id": "A", "name": "A", "labels": ["Entity"]},
+                        {"id": "B", "name": "B", "labels": ["Entity"]},
+                    ],
+                    "relationships": [{"type": "RELATED_TO", "properties": {}}],
+                }
+            ]
+
+            repo = Neo4jRepository()
+            result = repo.bfs_search("A", "B", max_depth=5)
+
+            assert result is not None
+            assert len(result["nodes"]) == 2
+            assert result["nodes"][0]["id"] == "A"
+
+    def test_bfs_fallback_to_simple_path(self, mock_neo4j_graph):
+        """Test that BFS falls back to simple path when APOC and bidirectional fail."""
+        with patch("src.repositories.neo4j_repository.Neo4jGraph") as neo4j_mock:
+            neo4j_mock.return_value = mock_neo4j_graph
+            # First call (APOC) fails, second (bidirectional) fails, third (simple) succeeds
+            mock_neo4j_graph.query.side_effect = [
+                Exception("APOC not available"),
+                Exception("Bidirectional failed"),
+                [
+                    {
+                        "nodes": [
+                            {"id": "X", "name": "X", "labels": ["Entity"]},
+                            {"id": "Y", "name": "Y", "labels": ["Entity"]},
+                        ],
+                        "relationships": [{"type": "LINKS_TO", "properties": {}}],
+                    }
+                ],
+            ]
+
+            repo = Neo4jRepository()
+            result = repo.bfs_search("X", "Y")
+
+            assert result is not None
+            assert len(result["nodes"]) == 2
+
+    def test_bfs_returns_none_when_no_path(self, mock_neo4j_graph):
+        """Test that BFS returns None when no path exists."""
+        with patch("src.repositories.neo4j_repository.Neo4jGraph") as neo4j_mock:
+            neo4j_mock.return_value = mock_neo4j_graph
+            mock_neo4j_graph.query.side_effect = [
+                Exception("APOC"),
+                Exception("Bidir"),
+                [],
+            ]
+
+            repo = Neo4jRepository()
+            result = repo.bfs_search("isolated_a", "isolated_b")
+
+            assert result is None
+
+
+class TestParallelBFS:
+    """Tests for multi-source parallel BFS."""
+
+    def test_parallel_bfs_merges_subgraphs(self, mock_neo4j_graph):
+        """Test that parallel BFS merges subgraphs from multiple seeds."""
+        with patch("src.repositories.neo4j_repository.Neo4jGraph") as neo4j_mock:
+            neo4j_mock.return_value = mock_neo4j_graph
+            # Each seed expansion returns different nodes
+            # APOC fails, fallback returns nodes
+            mock_neo4j_graph.query.side_effect = [
+                Exception("APOC"),  # seed 1 APOC attempt
+                [
+                    {
+                        "nodes": [
+                            {
+                                "id": "A",
+                                "name": "A",
+                                "labels": ["E"],
+                                "description": "",
+                            },
+                            {
+                                "id": "C",
+                                "name": "C",
+                                "labels": ["E"],
+                                "description": "bridge",
+                            },
+                        ]
+                    }
+                ],
+                Exception("APOC"),  # seed 2 APOC attempt
+                [
+                    {
+                        "nodes": [
+                            {
+                                "id": "B",
+                                "name": "B",
+                                "labels": ["E"],
+                                "description": "",
+                            },
+                            {
+                                "id": "C",
+                                "name": "C",
+                                "labels": ["E"],
+                                "description": "bridge",
+                            },
+                        ]
+                    }
+                ],
+            ]
+
+            repo = Neo4jRepository()
+            result = repo.parallel_bfs_from_seeds(["A", "B"], max_depth=2)
+
+            # Should have 3 unique nodes (A, B, C)
+            node_ids = {n["id"] for n in result["nodes"]}
+            assert "A" in node_ids
+            assert "B" in node_ids
+            assert "C" in node_ids
+            assert len(node_ids) == 3
+
+    def test_parallel_bfs_identifies_bridge_nodes(self, mock_neo4j_graph):
+        """Test that bridge nodes (found from 2+ seeds) are correctly identified."""
+        with patch("src.repositories.neo4j_repository.Neo4jGraph") as neo4j_mock:
+            neo4j_mock.return_value = mock_neo4j_graph
+            mock_neo4j_graph.query.side_effect = [
+                Exception("APOC"),
+                [
+                    {
+                        "nodes": [
+                            {
+                                "id": "seed1",
+                                "name": "S1",
+                                "labels": ["E"],
+                                "description": "",
+                            },
+                            {
+                                "id": "bridge",
+                                "name": "Bridge",
+                                "labels": ["E"],
+                                "description": "shared",
+                            },
+                        ]
+                    }
+                ],
+                Exception("APOC"),
+                [
+                    {
+                        "nodes": [
+                            {
+                                "id": "seed2",
+                                "name": "S2",
+                                "labels": ["E"],
+                                "description": "",
+                            },
+                            {
+                                "id": "bridge",
+                                "name": "Bridge",
+                                "labels": ["E"],
+                                "description": "shared",
+                            },
+                        ]
+                    }
+                ],
+            ]
+
+            repo = Neo4jRepository()
+            result = repo.parallel_bfs_from_seeds(["seed1", "seed2"], max_depth=2)
+
+            bridge_ids = {b["id"] for b in result["bridge_nodes"]}
+            assert "bridge" in bridge_ids
+            # Seeds themselves should NOT be in bridge_nodes
+            assert "seed1" not in bridge_ids
+            assert "seed2" not in bridge_ids
+
+    def test_parallel_bfs_empty_seeds(self, mock_neo4j_graph):
+        """Test that empty seed list returns empty result."""
+        repo = Neo4jRepository()
+        result = repo.parallel_bfs_from_seeds([])
+
+        assert result["nodes"] == []
+        assert result["relationships"] == []
+        assert result["bridge_nodes"] == []
+
+    def test_parallel_bfs_deduplicates_seeds(self, mock_neo4j_graph):
+        """Test that duplicate seed IDs are deduplicated."""
+        with patch("src.repositories.neo4j_repository.Neo4jGraph") as neo4j_mock:
+            neo4j_mock.return_value = mock_neo4j_graph
+            mock_neo4j_graph.query.side_effect = [
+                Exception("APOC"),
+                [
+                    {
+                        "nodes": [
+                            {"id": "A", "name": "A", "labels": ["E"], "description": ""}
+                        ]
+                    }
+                ],
+            ]
+
+            repo = Neo4jRepository()
+            result = repo.parallel_bfs_from_seeds(["A", "A", "A"], max_depth=2)
+
+            # Should only expand once (deduplicated)
+            assert len(result["nodes"]) == 1
+
+
+class TestGraphRerank:
+    """Tests for graph-aware reranking."""
+
+    def test_reranking_boosts_connected_entities(self, mock_neo4j_graph):
+        """Test that entities closer in the graph get higher blended scores."""
+        with patch("src.repositories.neo4j_repository.Neo4jGraph") as neo4j_mock:
+            neo4j_mock.return_value = mock_neo4j_graph
+            # Return proximity distances
+            mock_neo4j_graph.query.return_value = [
+                {"eid": "close_entity", "min_distance": 1},
+                {"eid": "far_entity", "min_distance": 5},
+            ]
+
+            entities = [
+                {"id": "far_entity", "score": 0.9, "name": "Far"},
+                {"id": "close_entity", "score": 0.8, "name": "Close"},
+            ]
+
+            repo = Neo4jRepository()
+            result = repo.graph_rerank(
+                entities,
+                query_entity_ids=["query_node"],
+                vector_weight=0.6,
+                graph_weight=0.4,
+            )
+
+            # Close entity (distance=1, proximity=0.833) should rank higher
+            # despite lower vector score
+            # close: 0.6*0.8 + 0.4*0.833 = 0.48 + 0.333 = 0.813
+            # far:   0.6*0.9 + 0.4*0.167 = 0.54 + 0.067 = 0.607
+            assert result[0]["id"] == "close_entity"
+            assert result[0]["graph_proximity"] > result[1]["graph_proximity"]
+
+    def test_reranking_preserves_entities_on_failure(self, mock_neo4j_graph):
+        """Test that reranking returns original entities if query fails."""
+        with patch("src.repositories.neo4j_repository.Neo4jGraph") as neo4j_mock:
+            neo4j_mock.return_value = mock_neo4j_graph
+            mock_neo4j_graph.query.side_effect = Exception("Query failed")
+
+            entities = [
+                {"id": "A", "score": 0.9, "name": "A"},
+                {"id": "B", "score": 0.8, "name": "B"},
+            ]
+
+            repo = Neo4jRepository()
+            result = repo.graph_rerank(entities, query_entity_ids=["Q"])
+
+            # Should return original entities unchanged
+            assert len(result) == 2
+            assert result[0]["id"] == "A"
+
+    def test_reranking_empty_input(self, mock_neo4j_graph):
+        """Test that empty inputs are handled gracefully."""
+        repo = Neo4jRepository()
+
+        assert repo.graph_rerank([], ["Q"]) == []
+        assert repo.graph_rerank([{"id": "A", "score": 0.9}], []) == [
+            {"id": "A", "score": 0.9}
+        ]

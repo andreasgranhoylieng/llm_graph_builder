@@ -1,8 +1,10 @@
 """
 Neo4j Repository - Comprehensive graph database operations with vector search and traversal.
+Enhanced with SOTA GraphRAG: bidirectional BFS, parallel multi-source BFS, graph-aware reranking.
 """
 
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Set
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from langchain_neo4j import Neo4jGraph, GraphCypherQAChain
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_core.prompts import PromptTemplate
@@ -449,21 +451,84 @@ class Neo4jRepository(INeo4jRepository):
 
     def bfs_search(
         self, start_id: str, end_id: str, max_depth: int = 5
-    ) -> Optional[List[Dict[str, Any]]]:
+    ) -> Optional[Dict[str, Any]]:
         """
-        Find ANY path between two nodes using Breadth-First Search (BFS).
-        Useful when shortestPath is too strict or fails.
+        Find a path between two nodes using Bidirectional BFS.
+
+        Strategy:
+        1. Try APOC-based true BFS with terminator nodes (optimal)
+        2. Fallback to bidirectional frontier expansion via two Cypher queries
+        3. Final fallback to simple variable-length path match
         """
         graph = self._get_graph()
 
-        # Cypher doesn't have a direct "BFS" keyword but variable length paths
-        # without shortestPath use DFS/BFS depending on implementation.
-        # We can force a simple path check which usually finds *a* path.
+        # --- Strategy 1: APOC BFS (true breadth-first, optimal) ---
+        try:
+            apoc_cypher = f"""
+            MATCH (start {{id: $start_id}}), (end {{id: $end_id}})
+            CALL apoc.path.expandConfig(start, {{
+                terminatorNodes: [end],
+                maxLevel: {max_depth},
+                bfs: true,
+                uniqueness: 'NODE_GLOBAL'
+            }}) YIELD path
+            RETURN
+                [n IN nodes(path) | {{id: n.id, name: COALESCE(n.name, n.id), labels: labels(n)}}] as nodes,
+                [r IN relationships(path) | {{type: type(r), properties: properties(r)}}] as relationships
+            ORDER BY length(path)
+            LIMIT 1
+            """
+            results = graph.query(
+                apoc_cypher, params={"start_id": start_id, "end_id": end_id}
+            )
+            if results:
+                return {
+                    "nodes": results[0]["nodes"],
+                    "relationships": results[0]["relationships"],
+                }
+        except Exception:
+            pass  # APOC not available, continue to fallback
+
+        # --- Strategy 2: Bidirectional frontier expansion ---
+        # Expand from both ends simultaneously, find overlap
+        try:
+            bidir_cypher = f"""
+            MATCH (start {{id: $start_id}}), (end {{id: $end_id}})
+            WITH start, end
+            OPTIONAL MATCH path_fwd = (start)-[*1..{max_depth // 2 + 1}]-(mid)
+            WITH start, end, collect(DISTINCT mid) as fwd_frontier
+            OPTIONAL MATCH path_bwd = (end)-[*1..{max_depth // 2 + 1}]-(mid2)
+            WHERE mid2 IN fwd_frontier
+            WITH start, end, mid2 as meeting_point
+            WHERE meeting_point IS NOT NULL
+            LIMIT 1
+            MATCH path1 = shortestPath((start)-[*..{max_depth}]-(meeting_point))
+            MATCH path2 = shortestPath((meeting_point)-[*..{max_depth}]-(end))
+            WITH nodes(path1) + tail(nodes(path2)) as all_nodes,
+                 relationships(path1) + relationships(path2) as all_rels
+            RETURN
+                [n IN all_nodes | {{id: n.id, name: COALESCE(n.name, n.id), labels: labels(n)}}] as nodes,
+                [r IN all_rels | {{type: type(r), properties: properties(r)}}] as relationships
+            LIMIT 1
+            """
+            results = graph.query(
+                bidir_cypher, params={"start_id": start_id, "end_id": end_id}
+            )
+            if results and results[0].get("nodes"):
+                return {
+                    "nodes": results[0]["nodes"],
+                    "relationships": results[0]["relationships"],
+                }
+        except Exception:
+            pass  # Continue to final fallback
+
+        # --- Strategy 3: Simple variable-length path (original fallback) ---
         cypher = f"""
         MATCH path = (start {{id: $start_id}})-[*1..{max_depth}]-(end {{id: $end_id}})
-        RETURN 
+        RETURN
             [n IN nodes(path) | {{id: n.id, name: COALESCE(n.name, n.id), labels: labels(n)}}] as nodes,
             [r IN relationships(path) | {{type: type(r), properties: properties(r)}}] as relationships
+        ORDER BY length(path)
         LIMIT 1
         """
 
@@ -480,6 +545,223 @@ class Neo4jRepository(INeo4jRepository):
         except Exception as e:
             print(f"BFS search failed: {e}")
             return None
+
+    def parallel_bfs_from_seeds(
+        self, seed_ids: List[str], max_depth: int = 3
+    ) -> Dict[str, Any]:
+        """
+        Launch parallel BFS expansions from multiple seed nodes.
+        Merges discovered subgraphs, deduplicates, and identifies bridge nodes.
+
+        Args:
+            seed_ids: List of entity IDs to expand from
+            max_depth: How far to expand from each seed
+
+        Returns:
+            {
+                "nodes": deduplicated list of all discovered nodes,
+                "relationships": deduplicated list of all discovered relationships,
+                "bridge_nodes": nodes found in multiple seed expansions,
+                "seed_subgraphs": {seed_id: subgraph} mapping
+            }
+        """
+        if not seed_ids:
+            return {
+                "nodes": [],
+                "relationships": [],
+                "bridge_nodes": [],
+                "seed_subgraphs": {},
+            }
+
+        # Deduplicate seed IDs
+        seed_ids = list(set(seed_ids))
+
+        def _expand_single_seed(seed_id: str) -> Dict[str, Any]:
+            """Expand from a single seed node."""
+            graph = self._get_graph()
+
+            # Try APOC first for true BFS
+            try:
+                apoc_cypher = f"""
+                MATCH (center {{id: $seed_id}})
+                CALL apoc.path.subgraphAll(center, {{maxLevel: {max_depth}}})
+                YIELD nodes, relationships
+                RETURN
+                    [n IN nodes | {{
+                        id: n.id,
+                        name: COALESCE(n.name, n.id),
+                        labels: labels(n),
+                        description: n.description
+                    }}] as nodes,
+                    [r IN relationships | {{
+                        type: type(r),
+                        start: startNode(r).id,
+                        end: endNode(r).id
+                    }}] as relationships
+                """
+                results = graph.query(apoc_cypher, params={"seed_id": seed_id})
+                if results:
+                    return {
+                        "nodes": results[0]["nodes"],
+                        "relationships": results[0]["relationships"],
+                    }
+            except Exception:
+                pass  # APOC not available
+
+            # Fallback: variable-length path expansion
+            fallback_cypher = f"""
+            MATCH (center {{id: $seed_id}})-[r*0..{max_depth}]-(connected)
+            WITH DISTINCT connected,
+                 [rel IN r | type(rel)] as rel_types
+            RETURN
+                collect(DISTINCT {{
+                    id: connected.id,
+                    name: COALESCE(connected.name, connected.id),
+                    labels: labels(connected),
+                    description: connected.description
+                }}) as nodes
+            """
+            try:
+                results = graph.query(fallback_cypher, params={"seed_id": seed_id})
+                return {
+                    "nodes": results[0]["nodes"] if results else [],
+                    "relationships": [],
+                }
+            except Exception as e:
+                print(f"Seed expansion failed for {seed_id}: {e}")
+                return {"nodes": [], "relationships": []}
+
+        # Run expansions in parallel
+        seed_subgraphs = {}
+        max_workers = min(len(seed_ids), config.MAX_PARALLEL_BFS_WORKERS)
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_seed = {
+                executor.submit(_expand_single_seed, sid): sid for sid in seed_ids
+            }
+            for future in as_completed(future_to_seed):
+                seed_id = future_to_seed[future]
+                try:
+                    seed_subgraphs[seed_id] = future.result()
+                except Exception as e:
+                    print(f"Parallel BFS failed for seed {seed_id}: {e}")
+                    seed_subgraphs[seed_id] = {"nodes": [], "relationships": []}
+
+        # Merge and deduplicate
+        all_nodes: Dict[str, Dict] = {}
+        all_rels: List[Dict] = []
+        node_occurrence: Dict[str, int] = {}  # How many seeds found this node
+        seen_rels: Set[str] = set()
+
+        for seed_id, subgraph in seed_subgraphs.items():
+            for node in subgraph.get("nodes", []):
+                nid = node.get("id")
+                if nid:
+                    all_nodes[nid] = node
+                    node_occurrence[nid] = node_occurrence.get(nid, 0) + 1
+
+            for rel in subgraph.get("relationships", []):
+                rel_key = f"{rel.get('start')}_{rel.get('type')}_{rel.get('end')}"
+                if rel_key not in seen_rels:
+                    seen_rels.add(rel_key)
+                    all_rels.append(rel)
+
+        # Bridge nodes: found from 2+ different seed expansions
+        bridge_nodes = [
+            all_nodes[nid]
+            for nid, count in node_occurrence.items()
+            if count >= 2 and nid not in seed_ids
+        ]
+
+        return {
+            "nodes": list(all_nodes.values()),
+            "relationships": all_rels,
+            "bridge_nodes": bridge_nodes,
+            "seed_subgraphs": seed_subgraphs,
+        }
+
+    def graph_rerank(
+        self,
+        entities: List[Dict[str, Any]],
+        query_entity_ids: List[str],
+        vector_weight: float = None,
+        graph_weight: float = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Rerank entity results by combining vector similarity with graph proximity.
+
+        For each entity, computes:
+            final_score = vector_weight * vector_score + graph_weight * graph_proximity_score
+
+        Graph proximity is measured by shortest path distance to any query entity.
+        """
+        if not entities or not query_entity_ids:
+            return entities
+
+        vector_weight = vector_weight or config.RERANK_VECTOR_WEIGHT
+        graph_weight = graph_weight or config.RERANK_GRAPH_WEIGHT
+
+        graph = self._get_graph()
+        entity_ids = [e.get("id") for e in entities if e.get("id")]
+
+        # Batch query: get shortest path lengths from each entity to any query entity
+        proximity_cypher = """
+        UNWIND $entity_ids as eid
+        UNWIND $query_ids as qid
+        OPTIONAL MATCH path = shortestPath(
+            (e {id: eid})-[*..5]-(q {id: qid})
+        )
+        WITH eid, MIN(CASE WHEN path IS NOT NULL THEN length(path) ELSE null END) as min_distance
+        RETURN eid, min_distance
+        """
+
+        try:
+            results = graph.query(
+                proximity_cypher,
+                params={"entity_ids": entity_ids, "query_ids": query_entity_ids},
+            )
+
+            # Build distance map
+            distance_map = {}
+            for row in results:
+                eid = row.get("eid")
+                dist = row.get("min_distance")
+                if eid is not None:
+                    distance_map[eid] = dist
+
+        except Exception as e:
+            print(f"Graph reranking proximity query failed: {e}")
+            # Fall back to pure vector ranking
+            return entities
+
+        # Compute blended scores
+        max_distance = 6  # Normalize distances: anything >= 6 hops gets proximity 0
+        reranked = []
+
+        for entity in entities:
+            eid = entity.get("id")
+            vector_score = entity.get("score", 0.0)
+
+            dist = distance_map.get(eid)
+            if dist is not None:
+                # Proximity score: 1.0 for distance 0 (same node), decreasing
+                graph_proximity = max(0.0, 1.0 - (dist / max_distance))
+            else:
+                graph_proximity = 0.0  # No path found
+
+            blended_score = (vector_weight * vector_score) + (
+                graph_weight * graph_proximity
+            )
+
+            reranked_entity = dict(entity)
+            reranked_entity["original_score"] = vector_score
+            reranked_entity["graph_proximity"] = graph_proximity
+            reranked_entity["score"] = round(blended_score, 4)
+            reranked.append(reranked_entity)
+
+        # Sort by blended score descending
+        reranked.sort(key=lambda x: x["score"], reverse=True)
+        return reranked
 
     def get_subgraph(self, center_id: str, max_depth: int = 2) -> Dict[str, Any]:
         """Get a subgraph centered on a node."""
@@ -537,88 +819,155 @@ class Neo4jRepository(INeo4jRepository):
 
     def query_hybrid(self, question: str, top_k: int = 10) -> Dict[str, Any]:
         """
-        Hybrid query combining vector search, document search, and graph traversal.
+        SOTA Hybrid query combining vector search, parallel BFS expansion,
+        graph-aware reranking, and LLM synthesis.
 
         Pipeline:
-        1. Vector search entities
-        2. Vector search document chunks
-        3. Expand graph context around found entities
-        4. Use LLM to synthesize answer from combined context
+        1. RETRIEVE  - Vector search entities + document chunks
+        2. EXPAND    - Parallel BFS from top-K entity seeds
+        3. RERANK    - Blend vector similarity with graph proximity
+        4. SYNTHESIZE - Feed reranked, expanded context to LLM
         """
-        # Step 1: Vector search for relevant entities
+        # === Stage 1: RETRIEVE ===
         entities = self.vector_search(
             question, top_k=top_k, score_threshold=config.VECTOR_SEARCH_SCORE_THRESHOLD
         )
-
-        # Step 2: Also search document chunks for additional context
         doc_chunks = self.vector_search_documents(question, top_k=5)
 
         if not entities and not doc_chunks:
-            # Fallback to pure Cypher query
             return {
                 "answer": self.query(question),
                 "entities_found": [],
                 "graph_context": [],
+                "bridge_nodes": [],
                 "confidence": 0.3,
                 "method": "cypher_fallback",
             }
 
-        # Step 3: Expand graph context around top entities
-        graph_context = []
-        for entity in entities[:3]:  # Top 3 entities
-            neighbors = self.get_neighbors(
-                entity["id"], depth=config.HYBRID_SEARCH_DEPTH
-            )
-            graph_context.extend(neighbors)
+        # === Stage 2: EXPAND via parallel BFS ===
+        seed_ids = [e["id"] for e in entities[:5] if e.get("id")]  # Top 5 as seeds
+        expanded_subgraph = {"nodes": [], "relationships": [], "bridge_nodes": []}
 
-        # Step 4: Build comprehensive context for LLM
+        if seed_ids:
+            try:
+                expanded_subgraph = self.parallel_bfs_from_seeds(
+                    seed_ids, max_depth=config.MULTI_HOP_CONTEXT_DEPTH
+                )
+            except Exception as e:
+                print(f"Parallel BFS expansion failed, falling back to neighbors: {e}")
+                # Fallback to simple neighbor expansion
+                for entity in entities[:3]:
+                    neighbors = self.get_neighbors(
+                        entity["id"], depth=config.HYBRID_SEARCH_DEPTH
+                    )
+                    expanded_subgraph["nodes"].extend(neighbors)
+
+        # === Stage 3: RERANK with graph proximity ===
+        if entities and seed_ids:
+            try:
+                entities = self.graph_rerank(
+                    entities,
+                    query_entity_ids=seed_ids[:3],
+                    vector_weight=config.RERANK_VECTOR_WEIGHT,
+                    graph_weight=config.RERANK_GRAPH_WEIGHT,
+                )
+            except Exception as e:
+                print(f"Graph reranking failed, using vector-only ranking: {e}")
+
+        # === Stage 4: SYNTHESIZE ===
         context_parts = []
 
-        # Add document chunk context (most relevant first!)
+        # Document chunks (highest fidelity source)
         if doc_chunks:
             context_parts.append("## Relevant Source Documents:")
             for chunk in doc_chunks[:3]:
                 content = chunk.get("content", "")
                 if content:
-                    # Truncate very long chunks
                     content = content[:800] + "..." if len(content) > 800 else content
                     context_parts.append(f"```\n{content}\n```")
 
-        # Add entity information
+        # Reranked entity context
         if entities:
-            context_parts.append("\n## Key Entities Found:")
+            context_parts.append(
+                "\n## Key Entities Found (ranked by relevance + graph proximity):"
+            )
             for ent in entities[:5]:
                 labels = ", ".join(
-                    [l for l in ent.get("labels", []) if l != "__Entity__"]
+                    [label for label in ent.get("labels", []) if label != "__Entity__"]
                 )
                 desc = ent.get("description") or "No description available"
                 name = ent.get("name", ent.get("id", "Unknown"))
+                score_info = f"score={ent.get('score', 0):.2f}"
+                if ent.get("graph_proximity") is not None:
+                    score_info += f", graph_proximity={ent['graph_proximity']:.2f}"
+                context_parts.append(f"- **{name}** ({labels}, {score_info}): {desc}")
+
+        # Bridge nodes (entities connecting multiple seed entities)
+        bridge_nodes = expanded_subgraph.get("bridge_nodes", [])
+        if bridge_nodes:
+            context_parts.append("\n## Bridge Entities (connecting multiple topics):")
+            for bn in bridge_nodes[:5]:
+                name = bn.get("name", bn.get("id", "Unknown"))
+                labels = ", ".join(
+                    [label for label in bn.get("labels", []) if label != "__Entity__"]
+                )
+                desc = bn.get("description") or ""
                 context_parts.append(f"- **{name}** ({labels}): {desc}")
 
-        # Add relationship context
-        if graph_context:
-            context_parts.append("\n## Connected Entities:")
-            seen = set()
-            for ctx in graph_context[:10]:
-                ctx_id = ctx.get("id")
-                if ctx_id and ctx_id not in seen:
-                    seen.add(ctx_id)
-                    rel = ctx.get("relationship", "RELATED_TO")
-                    name = ctx.get("name", ctx_id)
-                    context_parts.append(f"- {name} ({rel})")
+        # Expanded graph context (discovered via BFS)
+        expanded_nodes = expanded_subgraph.get("nodes", [])
+        if expanded_nodes:
+            context_parts.append("\n## Expanded Graph Context:")
+            seen = set(e.get("id") for e in entities[:5])  # Skip already-shown entities
+            count = 0
+            for node in expanded_nodes:
+                nid = node.get("id")
+                if nid and nid not in seen and count < 10:
+                    seen.add(nid)
+                    name = node.get("name", nid)
+                    labels = ", ".join(
+                        [
+                            label
+                            for label in node.get("labels", [])
+                            if label != "__Entity__"
+                        ]
+                    )
+                    desc = node.get("description") or ""
+                    if desc:
+                        context_parts.append(f"- {name} ({labels}): {desc}")
+                    else:
+                        context_parts.append(f"- {name} ({labels})")
+                    count += 1
+
+        # Relationship chains
+        expanded_rels = expanded_subgraph.get("relationships", [])
+        if expanded_rels:
+            context_parts.append("\n## Relationship Chains:")
+            for rel in expanded_rels[:15]:
+                start = rel.get("start", "?")
+                end = rel.get("end", "?")
+                rel_type = rel.get("type", "RELATED_TO")
+                context_parts.append(f"- {start} --[{rel_type}]--> {end}")
 
         context_str = "\n".join(context_parts)
 
-        # Step 5: Use LLM to synthesize answer
+        # LLM synthesis
         llm = ChatOpenAI(temperature=0, model_name=config.LLM_MODEL)
 
         prompt = f"""Based on the following knowledge from a knowledge graph and source documents, answer the question.
+
+The information includes:
+- Source documents (raw text from original files)
+- Key entities found via semantic search, ranked by combined vector similarity and graph proximity
+- Bridge entities that connect multiple topics in the knowledge graph
+- Expanded graph context showing related entities discovered through graph traversal
+- Relationship chains showing how entities are connected
 
 {context_str}
 
 Question: {question}
 
-Provide a clear, comprehensive answer based on the information above. Use the source documents for details and the entity information for key facts.
+Provide a clear, comprehensive answer. Prioritize information from source documents for details and use the knowledge graph structure for understanding relationships and connections. If bridge entities are relevant, explain how they connect the topics.
 
 Answer:"""
 
@@ -628,9 +977,15 @@ Answer:"""
         except Exception as e:
             answer = f"Error generating answer: {e}"
 
-        # Calculate confidence based on both entities and docs
+        # Confidence: blend of vector score, graph proximity, and doc coverage
         if entities:
-            confidence = min(entities[0]["score"], 1.0)
+            top_score = entities[0].get("score", 0)
+            has_bridges = len(bridge_nodes) > 0
+            has_docs = len(doc_chunks) > 0
+            confidence = min(
+                top_score * (1.1 if has_bridges else 1.0) * (1.1 if has_docs else 1.0),
+                1.0,
+            )
         elif doc_chunks:
             confidence = min(doc_chunks[0].get("score", 0.5), 0.8)
         else:
@@ -639,10 +994,11 @@ Answer:"""
         return {
             "answer": answer,
             "entities_found": entities,
-            "graph_context": graph_context[:10],
+            "graph_context": expanded_nodes[:10],
+            "bridge_nodes": bridge_nodes,
             "doc_chunks_used": len(doc_chunks),
-            "confidence": confidence,
-            "method": "hybrid",
+            "confidence": round(confidence, 3),
+            "method": "hybrid_sota",
         }
 
     def query(self, question: str) -> str:

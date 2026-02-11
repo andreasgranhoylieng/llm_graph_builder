@@ -31,6 +31,7 @@ class TestFindConnections:
         """Test when no path exists between entities."""
         mock_repo = MagicMock()
         mock_repo.find_path.return_value = None
+        mock_repo.bfs_search.return_value = None  # BFS fallback also finds nothing
 
         service = TraversalService(mock_repo)
         result = service.find_connections("EntityA", "EntityB")
@@ -222,6 +223,7 @@ class TestCompareModels:
         ]
 
         mock_repo.find_path.return_value = None  # No direct connection
+        mock_repo.bfs_search.return_value = None  # BFS fallback also finds nothing
 
         service = TraversalService(mock_repo)
         result = service.compare_models("GPT-4", "Claude-3")
@@ -284,3 +286,66 @@ class TestResearchLineage:
 
         assert result["count"] == 0
         assert "error" in result
+
+
+class TestMultiEntityContext:
+    """Tests for multi-entity context extraction via parallel BFS."""
+
+    def test_multi_entity_context_returns_bridge_nodes(self):
+        """Test that multi-entity context identifies bridge nodes from parallel BFS."""
+        mock_repo = MagicMock()
+
+        # Mock get_node_by_id to return entity details
+        mock_repo.get_node_by_id.side_effect = lambda eid: {
+            "id": eid,
+            "name": eid.upper(),
+            "labels": ["Entity"],
+            "description": f"Description of {eid}",
+        }
+
+        # Mock parallel_bfs_from_seeds
+        mock_repo.parallel_bfs_from_seeds.return_value = {
+            "nodes": [
+                {"id": "a", "name": "A", "labels": ["Entity"]},
+                {"id": "b", "name": "B", "labels": ["Entity"]},
+                {"id": "bridge", "name": "Bridge", "labels": ["Entity"]},
+            ],
+            "relationships": [
+                {"start": "a", "end": "bridge", "type": "CONNECTS"},
+                {"start": "bridge", "end": "b", "type": "CONNECTS"},
+            ],
+            "bridge_nodes": [
+                {"id": "bridge", "name": "Bridge", "labels": ["Entity"]},
+            ],
+        }
+
+        service = TraversalService(mock_repo)
+        result = service.get_multi_entity_context(["a", "b"], max_depth=3)
+
+        assert len(result["bridge_nodes"]) == 1
+        assert result["bridge_nodes"][0]["id"] == "bridge"
+        assert len(result["relationship_chains"]) == 2
+        assert "a --[CONNECTS]--> bridge" in result["relationship_chains"]
+        assert "Context for 2 entities" in result["context_summary"]
+
+    def test_multi_entity_context_empty_seeds(self):
+        """Test graceful handling of empty entity list."""
+        mock_repo = MagicMock()
+
+        service = TraversalService(mock_repo)
+        result = service.get_multi_entity_context([])
+
+        assert result["entities"] == []
+        assert result["bridge_nodes"] == []
+        assert "No entities provided" in result["context_summary"]
+
+    def test_multi_entity_context_missing_entities(self):
+        """Test handling when entities are not found in the graph."""
+        mock_repo = MagicMock()
+        mock_repo.get_node_by_id.return_value = None
+
+        service = TraversalService(mock_repo)
+        result = service.get_multi_entity_context(["nonexistent1", "nonexistent2"])
+
+        assert result["entities"] == []
+        assert "None of the provided entities were found" in result["context_summary"]
