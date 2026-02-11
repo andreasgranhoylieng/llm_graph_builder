@@ -41,3 +41,36 @@ def test_chunk_documents_assigns_ids_for_legacy_path():
     assert chunks
     assert "id" in chunks[0].metadata
     assert "chunk_id" in chunks[0].metadata
+
+
+def test_optimize_chunks_deduplicates_by_normalized_content():
+    mock_file_repo = MagicMock()
+    service = IngestService(mock_file_repo)
+
+    chunk_a = Document(page_content="GPT-4   is   powerful.", metadata={})
+    chunk_b = Document(page_content="GPT-4 is powerful.", metadata={})
+    chunk_c = Document(page_content="Claude is safe.", metadata={})
+
+    optimized = service._optimize_chunks([chunk_a, chunk_b, chunk_c])
+
+    assert len(optimized) == 2
+    assert all("content_fingerprint" in c.metadata for c in optimized)
+    assert all("char_count" in c.metadata for c in optimized)
+
+
+def test_filter_known_chunks_skips_already_seen_fingerprints():
+    mock_file_repo = MagicMock()
+    service = IngestService(mock_file_repo)
+
+    first = Document(page_content="Repeated text", metadata={})
+    second = Document(page_content="Repeated text", metadata={})
+    unique = Document(page_content="Different text", metadata={})
+
+    optimized = service._optimize_chunks([first, second, unique])
+    seen = {optimized[0].metadata["content_fingerprint"]}
+
+    remaining, duplicate_count = service.filter_known_chunks(optimized, seen)
+
+    assert duplicate_count == 1
+    assert len(remaining) == 1
+    assert remaining[0].page_content == "Different text"

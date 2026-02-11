@@ -4,6 +4,8 @@ Tests for GraphService - Graph extraction and document processing.
 
 from unittest.mock import MagicMock, patch
 
+from langchain_core.documents import Document
+
 from src.services.graph_service import GraphService
 
 
@@ -120,6 +122,44 @@ class TestBatchProcessing:
 
             # Should have recorded the failed batch
             assert result["chunks_failed"] > 0
+
+    def test_build_graph_concurrent_flushes_buffered_writes(self):
+        """Concurrent mode should flush writes in larger groups, not one DB call per batch."""
+
+        class MockGraphDoc:
+            def __init__(self):
+                self.nodes = []
+                self.relationships = []
+                self.source = None
+
+        mock_repo = MagicMock()
+        mock_repo.add_graph_documents_batch.return_value = {
+            "total_nodes": 0,
+            "total_relationships": 0,
+        }
+
+        docs = [
+            Document(page_content="Chunk 1", metadata={}),
+            Document(page_content="Chunk 2", metadata={}),
+        ]
+
+        service = GraphService(mock_repo)
+        service.rate_limiter = MagicMock()
+        service.rate_limiter.acquire.return_value = 0
+
+        with (
+            patch("src.services.graph_service.config.BATCH_SIZE_CHUNKS", 1),
+            patch("src.services.graph_service.config.GRAPH_WRITE_FLUSH_SIZE", 2),
+            patch.object(
+                GraphService,
+                "_process_single_batch",
+                side_effect=[[MockGraphDoc()], [MockGraphDoc()]],
+            ),
+        ):
+            result = service.build_graph_concurrent(docs, max_workers=2)
+
+        assert result["graph_documents"] == 2
+        assert mock_repo.add_graph_documents_batch.call_count == 1
 
 
 class TestQueryMethods:

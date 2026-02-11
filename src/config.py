@@ -4,6 +4,12 @@ from typing import List, Dict, Any
 
 load_dotenv()
 
+
+def _env_bool(name: str, default: bool) -> bool:
+    """Parse boolean-like environment values."""
+    value = os.getenv(name, str(default)).strip().lower()
+    return value in {"1", "true", "yes", "y", "on"}
+
 # =============================================================================
 # API KEYS AND DATABASE CONFIGURATION
 # =============================================================================
@@ -217,6 +223,29 @@ RELATIONSHIP_PROPERTIES: Dict[str, List[str]] = {
 BATCH_SIZE_FILES = 10
 BATCH_SIZE_CHUNKS = 50
 MAX_CONCURRENT_LLM_CALLS = 5
+GRAPH_BATCHES_PER_WORKER = int(os.getenv("GRAPH_BATCHES_PER_WORKER", "2"))
+GRAPH_MIN_BATCHES_PER_FILE = int(os.getenv("GRAPH_MIN_BATCHES_PER_FILE", "8"))
+GRAPH_LOG_RATE_LIMIT_WAIT = _env_bool("GRAPH_LOG_RATE_LIMIT_WAIT", True)
+
+# Ingestion quality/performance tuning
+INGEST_CHUNK_SIZE = int(os.getenv("INGEST_CHUNK_SIZE", "2000"))
+INGEST_CHUNK_OVERLAP = int(os.getenv("INGEST_CHUNK_OVERLAP", "200"))
+INGEST_MIN_CHUNK_CHARS = int(os.getenv("INGEST_MIN_CHUNK_CHARS", "1"))
+INGEST_NORMALIZE_WHITESPACE = _env_bool("INGEST_NORMALIZE_WHITESPACE", True)
+INGEST_DEDUP_WITHIN_FILE = _env_bool("INGEST_DEDUP_WITHIN_FILE", True)
+INGEST_DEDUP_ACROSS_JOB = _env_bool("INGEST_DEDUP_ACROSS_JOB", True)
+
+# Database write/embedding throughput tuning
+NEO4J_INGEST_BATCH_SIZE = int(os.getenv("NEO4J_INGEST_BATCH_SIZE", "100"))
+GRAPH_WRITE_FLUSH_SIZE = int(os.getenv("GRAPH_WRITE_FLUSH_SIZE", "300"))
+EMBEDDING_BATCH_SIZE = int(os.getenv("EMBEDDING_BATCH_SIZE", "96"))
+SKIP_EXISTING_EMBEDDINGS = _env_bool("SKIP_EXISTING_EMBEDDINGS", True)
+
+# Graph extraction detail/latency tradeoff
+GRAPH_EXTRACT_NODE_PROPERTIES = _env_bool("GRAPH_EXTRACT_NODE_PROPERTIES", True)
+GRAPH_EXTRACT_RELATIONSHIP_PROPERTIES = _env_bool(
+    "GRAPH_EXTRACT_RELATIONSHIP_PROPERTIES", True
+)
 
 # Rate Limiting (OpenAI tier-dependent)
 RATE_LIMIT_RPM = 500

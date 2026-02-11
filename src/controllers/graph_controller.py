@@ -257,6 +257,7 @@ class GraphController:
 
         # Step 6: Process files in batches
         files_since_checkpoint = 0
+        seen_chunk_fingerprints = set()
 
         try:
             for file_path in pending_files:
@@ -274,6 +275,22 @@ class GraphController:
 
                     if not chunks:
                         self.state_repo.mark_file_skipped(state, file_path)
+                        progress.complete_item()
+                        continue
+
+                    if config.INGEST_DEDUP_ACROSS_JOB:
+                        chunks, duplicate_count = self.ingest_service.filter_known_chunks(
+                            chunks, seen_chunk_fingerprints
+                        )
+                        if duplicate_count:
+                            print(
+                                f"Skipped {duplicate_count} duplicate chunks from {os.path.basename(file_path)}"
+                            )
+
+                    if not chunks:
+                        self.state_repo.mark_file_complete(
+                            state, file_path, chunks_processed=0
+                        )
                         progress.complete_item()
                         continue
 

@@ -444,6 +444,34 @@ class TestEmbeddingGeneration:
             texts = mock_embeddings.embed_documents.call_args_list[0][0][0]
             assert any(text.startswith("GPT-4: LLM") for text in texts)
 
+    def test_add_graph_documents_batch_skips_existing_embeddings(
+        self, sample_graph_document
+    ):
+        """If embeddings already exist in DB, avoid re-embedding to save cost."""
+        with (
+            patch("src.repositories.neo4j_repository.Neo4jGraph") as neo4j_mock,
+            patch("src.repositories.neo4j_repository.OpenAIEmbeddings") as emb_mock,
+        ):
+            mock_graph = MagicMock()
+            neo4j_mock.return_value = mock_graph
+
+            def query_side_effect(cypher, params=None):
+                if "WHERE n.embedding IS NULL" in cypher:
+                    return []  # no entities need embedding
+                if "WHERE d.embedding IS NULL" in cypher:
+                    return []  # no documents need embedding
+                return []
+
+            mock_graph.query.side_effect = query_side_effect
+
+            mock_embeddings = MagicMock()
+            emb_mock.return_value = mock_embeddings
+
+            repo = Neo4jRepository()
+            repo.add_graph_documents_batch([sample_graph_document])
+
+            assert mock_embeddings.embed_documents.call_count == 0
+
 
 class TestDatabaseManagement:
     """Tests for database management operations."""

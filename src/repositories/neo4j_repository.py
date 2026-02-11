@@ -137,106 +137,104 @@ class Neo4jRepository(INeo4jRepository):
         1. Entity nodes (using name + description)
         2. Document chunks (using full content)
         """
-        # Ensure connection is alive before processing batch
         self.verify_connectivity()
         graph = self._get_graph()
+
+        batch_size = max(1, batch_size)
+        embedding_batch_size = max(1, config.EMBEDDING_BATCH_SIZE)
 
         total_nodes = 0
         total_relationships = 0
         batches_processed = 0
 
+        embedded_node_ids: Set[str] = set()
+        embedded_doc_ids: Set[str] = set()
+
         for i in range(0, len(graph_documents), batch_size):
             batch = graph_documents[i : i + batch_size]
 
             try:
-                # Insert graph documents
                 graph.add_graph_documents(
                     batch, baseEntityLabel=True, include_source=include_source
                 )
 
-                # --- ENTITY EMBEDDING GENERATION ---
-                nodes_to_embed = {}  # id -> {name, description}
-                for g_doc in batch:
-                    for node in g_doc.nodes:
-                        if node.id not in nodes_to_embed:
-                            # Extract description from properties if available
-                            name = str(node.id)
-                            description = ""
-                            if hasattr(node, "properties") and node.properties:
-                                name = node.properties.get("name") or name
-                                description = node.properties.get("description", "")
-                            nodes_to_embed[node.id] = {
-                                "name": name,
-                                "description": description,
-                            }
+                nodes_to_embed = self._collect_nodes_for_embedding(
+                    batch, embedded_node_ids
+                )
+                docs_to_embed = self._collect_documents_for_embedding(
+                    batch, embedded_doc_ids
+                )
+
+                if config.SKIP_EXISTING_EMBEDDINGS and nodes_to_embed:
+                    missing_node_ids = self._filter_ids_without_embedding(
+                        graph, list(nodes_to_embed.keys()), label="__Entity__"
+                    )
+                    nodes_to_embed = {
+                        node_id: nodes_to_embed[node_id]
+                        for node_id in missing_node_ids
+                        if node_id in nodes_to_embed
+                    }
+
+                if config.SKIP_EXISTING_EMBEDDINGS and docs_to_embed:
+                    missing_doc_ids = self._filter_ids_without_embedding(
+                        graph, list(docs_to_embed.keys()), label="Document"
+                    )
+                    docs_to_embed = {
+                        doc_id: docs_to_embed[doc_id]
+                        for doc_id in missing_doc_ids
+                        if doc_id in docs_to_embed
+                    }
 
                 if nodes_to_embed:
-                    # Create embedding text: "name: description" for better semantic matching
                     node_ids = list(nodes_to_embed.keys())
-                    texts_to_embed = []
-                    for nid in node_ids:
-                        name = nodes_to_embed[nid]["name"]
-                        desc = nodes_to_embed[nid]["description"]
-                        if desc:
-                            texts_to_embed.append(f"{name}: {desc}")
-                        else:
-                            texts_to_embed.append(name)
-
-                    embeddings = self._get_embeddings().embed_documents(texts_to_embed)
-
-                    update_query = """
-                    UNWIND $data as item
-                    MATCH (n:__Entity__ {id: item.id})
-                    SET n.embedding = item.embedding,
-                        n.embedding_text = item.embedding_text,
-                        n.embedded_at = datetime()
-                    """
-                    data = [
-                        {"id": nid, "embedding": emb, "embedding_text": txt}
-                        for nid, emb, txt in zip(node_ids, embeddings, texts_to_embed)
-                    ]
-                    graph.query(update_query, params={"data": data})
-
-                # --- DOCUMENT CHUNK EMBEDDING ---
-                docs_to_embed = []
-                for g_doc in batch:
-                    if hasattr(g_doc, "source") and g_doc.source:
-                        metadata = g_doc.source.metadata or {}
-                        source_name = metadata.get("source") or metadata.get(
-                            "source_file", "unknown"
+                    node_texts = [
+                        (
+                            f"{nodes_to_embed[node_id]['name']}: {nodes_to_embed[node_id]['description']}"
+                            if nodes_to_embed[node_id]["description"]
+                            else nodes_to_embed[node_id]["name"]
                         )
-                        page = metadata.get("page", 0)
-                        chunk_id = metadata.get("chunk_id") or metadata.get("id")
-                        doc_content = g_doc.source.page_content
-                        if not chunk_id and doc_content:
-                            content_hash = hashlib.md5(
-                                doc_content.encode("utf-8")
-                            ).hexdigest()[:12]
-                            chunk_id = f"{source_name}#p{page}:{content_hash}"
-                        if chunk_id and doc_content:
-                            docs_to_embed.append(
-                                {"id": chunk_id, "content": doc_content}
-                            )
-
-                if docs_to_embed:
-                    doc_contents = [d["content"] for d in docs_to_embed]
-                    doc_embeddings = self._get_embeddings().embed_documents(
-                        doc_contents
+                        for node_id in node_ids
+                    ]
+                    node_embeddings = self._embed_texts_in_batches(
+                        node_texts, batch_size=embedding_batch_size
                     )
 
-                    doc_update_query = """
-                    UNWIND $data as item
-                    MATCH (d:Document {id: item.id})
-                    SET d.embedding = item.embedding,
-                        d.embedded_at = datetime()
-                    """
-                    doc_data = [
-                        {"id": d["id"], "embedding": emb}
-                        for d, emb in zip(docs_to_embed, doc_embeddings)
+                    node_data = [
+                        {"id": nid, "embedding": emb, "embedding_text": txt}
+                        for nid, emb, txt in zip(node_ids, node_embeddings, node_texts)
                     ]
-                    graph.query(doc_update_query, params={"data": doc_data})
+                    graph.query(
+                        """
+                        UNWIND $data as item
+                        MATCH (n:__Entity__ {id: item.id})
+                        SET n.embedding = item.embedding,
+                            n.embedding_text = item.embedding_text,
+                            n.embedded_at = datetime()
+                        """,
+                        params={"data": node_data},
+                    )
 
-                # Count nodes and relationships
+                if docs_to_embed:
+                    doc_ids = list(docs_to_embed.keys())
+                    doc_texts = [docs_to_embed[doc_id] for doc_id in doc_ids]
+                    doc_embeddings = self._embed_texts_in_batches(
+                        doc_texts, batch_size=embedding_batch_size
+                    )
+
+                    doc_data = [
+                        {"id": doc_id, "embedding": emb}
+                        for doc_id, emb in zip(doc_ids, doc_embeddings)
+                    ]
+                    graph.query(
+                        """
+                        UNWIND $data as item
+                        MATCH (d:Document {id: item.id})
+                        SET d.embedding = item.embedding,
+                            d.embedded_at = datetime()
+                        """,
+                        params={"data": doc_data},
+                    )
+
                 for doc in batch:
                     total_nodes += len(doc.nodes) if hasattr(doc, "nodes") else 0
                     total_relationships += (
@@ -246,7 +244,7 @@ class Neo4jRepository(INeo4jRepository):
                 batches_processed += 1
 
             except Exception as e:
-                print(f"⚠️ Batch {batches_processed + 1} failed: {e}")
+                print(f"Batch {batches_processed + 1} failed: {e}")
                 continue
 
         return {
@@ -254,6 +252,131 @@ class Neo4jRepository(INeo4jRepository):
             "total_nodes": total_nodes,
             "total_relationships": total_relationships,
         }
+
+    def _collect_nodes_for_embedding(
+        self, graph_documents: List, seen_node_ids: Set[str]
+    ) -> Dict[str, Dict[str, str]]:
+        """Collect unique node texts for embedding from a batch."""
+        nodes_to_embed: Dict[str, Dict[str, str]] = {}
+
+        for g_doc in graph_documents:
+            for node in getattr(g_doc, "nodes", []):
+                node_id = str(getattr(node, "id", "") or "")
+                if not node_id or node_id in seen_node_ids:
+                    continue
+
+                seen_node_ids.add(node_id)
+                name = node_id
+                description = ""
+                properties = getattr(node, "properties", {}) or {}
+                if properties:
+                    name = properties.get("name") or name
+                    description = properties.get("description", "")
+
+                nodes_to_embed[node_id] = {
+                    "name": str(name),
+                    "description": str(description or ""),
+                }
+
+        return nodes_to_embed
+
+    def _collect_documents_for_embedding(
+        self, graph_documents: List, seen_doc_ids: Set[str]
+    ) -> Dict[str, str]:
+        """Collect unique document chunks for embedding from a batch."""
+        docs_to_embed: Dict[str, str] = {}
+
+        for g_doc in graph_documents:
+            source = getattr(g_doc, "source", None)
+            if not source:
+                continue
+
+            metadata = (getattr(source, "metadata", None) or {}).copy()
+            content = getattr(source, "page_content", None)
+            if not content:
+                continue
+
+            source_name = metadata.get("source") or metadata.get("source_file", "unknown")
+            page = metadata.get("page", 0)
+            chunk_id = metadata.get("chunk_id") or metadata.get("id")
+            if not chunk_id:
+                content_hash = hashlib.md5(content.encode("utf-8")).hexdigest()[:12]
+                chunk_id = f"{source_name}#p{page}:{content_hash}"
+
+            chunk_id = str(chunk_id)
+            if chunk_id in seen_doc_ids:
+                continue
+
+            seen_doc_ids.add(chunk_id)
+            docs_to_embed[chunk_id] = str(content)
+
+        return docs_to_embed
+
+    def _embed_texts_in_batches(
+        self, texts: List[str], batch_size: int
+    ) -> List[List[float]]:
+        """Embed text in API-sized slices to improve stability and throughput."""
+        if not texts:
+            return []
+
+        embeddings_model = self._get_embeddings()
+        vectors: List[List[float]] = []
+
+        for i in range(0, len(texts), batch_size):
+            text_batch = texts[i : i + batch_size]
+            vectors.extend(embeddings_model.embed_documents(text_batch))
+
+        return vectors
+
+    def _filter_ids_without_embedding(
+        self, graph: Neo4jGraph, ids: List[str], label: str
+    ) -> List[str]:
+        """
+        Return ids that do not yet have an embedding.
+        Falls back to the original ids when query responses are unavailable/invalid.
+        """
+        if not ids:
+            return []
+
+        ids = [str(item) for item in ids if item]
+        if not ids:
+            return []
+
+        if label not in {"__Entity__", "Document"}:
+            return ids
+
+        result_ids: List[str] = []
+        query = (
+            """
+            UNWIND $ids as id
+            MATCH (n:__Entity__ {id: id})
+            WHERE n.embedding IS NULL
+            RETURN n.id as id
+            """
+            if label == "__Entity__"
+            else """
+            UNWIND $ids as id
+            MATCH (d:Document {id: id})
+            WHERE d.embedding IS NULL
+            RETURN d.id as id
+            """
+        )
+
+        for i in range(0, len(ids), 1000):
+            id_batch = ids[i : i + 1000]
+            try:
+                rows = graph.query(query, params={"ids": id_batch})
+                if not isinstance(rows, list):
+                    return ids
+                result_ids.extend(
+                    str(row.get("id"))
+                    for row in rows
+                    if isinstance(row, dict) and row.get("id")
+                )
+            except Exception:
+                return ids
+
+        return result_ids
 
     # =========================================================================
     # VECTOR SEARCH
@@ -1182,3 +1305,4 @@ Answer:"""
         """Execute a raw Cypher query."""
         graph = self._get_graph()
         return graph.query(query, params=params or {})
+

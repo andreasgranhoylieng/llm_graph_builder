@@ -3,6 +3,7 @@ GraphService - Handles graph extraction with concurrent processing and rate limi
 Enhanced with description extraction for better embeddings.
 """
 
+import math
 from typing import List, Optional, Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from langchain_openai import ChatOpenAI
@@ -48,8 +49,8 @@ class GraphService:
                 llm=self.llm,
                 allowed_nodes=config.ALLOWED_NODES,
                 allowed_relationships=config.ALLOWED_RELATIONSHIPS,
-                node_properties=True,  # Enable property extraction
-                relationship_properties=True,  # Enable relationship properties
+                node_properties=config.GRAPH_EXTRACT_NODE_PROPERTIES,
+                relationship_properties=config.GRAPH_EXTRACT_RELATIONSHIP_PROPERTIES,
             )
         return self._transformer
 
@@ -130,7 +131,9 @@ class GraphService:
         if all_graph_docs:
             print(f"💾 Saving {len(all_graph_docs)} graph documents to Neo4j...")
             stats = self.neo4j_repo.add_graph_documents_batch(
-                all_graph_docs, batch_size=100, include_source=True
+                all_graph_docs,
+                batch_size=config.NEO4J_INGEST_BATCH_SIZE,
+                include_source=True,
             )
         else:
             stats = {"total_nodes": 0, "total_relationships": 0}
@@ -163,27 +166,27 @@ class GraphService:
         Process documents using concurrent threads for higher throughput.
         """
         max_workers = max_workers or config.MAX_CONCURRENT_LLM_CALLS
-        batch_size = config.BATCH_SIZE_CHUNKS or 10
+        batch_size = self._resolve_concurrent_batch_size(len(docs), max_workers)
 
         if not docs:
             return {"chunks_processed": 0, "graph_documents": 0}
 
-        # Create batches
         batches = [docs[i : i + batch_size] for i in range(0, len(docs), batch_size)]
 
-        all_graph_docs = []
+        write_buffer: List = []
         processed_chunks = 0
         failed_chunks = 0
 
+        graph_documents_count = 0
         total_nodes = 0
         total_relationships = 0
+        flush_size = max(1, config.GRAPH_WRITE_FLUSH_SIZE)
 
         print(
-            f"🚀 Processing {len(docs)} chunks in {len(batches)} batches with {max_workers} workers..."
+            f"Processing {len(docs)} chunks in {len(batches)} batches with {max_workers} workers..."
         )
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # Submit all batches
             future_to_batch = {
                 executor.submit(self._process_single_batch, batch): batch
                 for batch in batches
@@ -196,38 +199,35 @@ class GraphService:
                 try:
                     graph_docs = future.result()
 
-                    # Enrich and save
                     if graph_docs:
                         self._enrich_graph_documents(graph_docs)
+                        graph_documents_count += len(graph_docs)
+                        write_buffer.extend(graph_docs)
 
-                        # Save to Neo4j immediately
-                        # Verify connection first (handled in repo)
-                        print(
-                            f"💾 Saving {len(graph_docs)} graph documents to Neo4j..."
-                        )
-                        stats = self.neo4j_repo.add_graph_documents_batch(
-                            graph_docs, batch_size=100, include_source=True
-                        )
-                        total_nodes += stats.get("total_nodes", 0)
-                        total_relationships += stats.get("total_relationships", 0)
-                        all_graph_docs.extend(graph_docs)
+                        if len(write_buffer) >= flush_size:
+                            stats = self._flush_graph_documents(write_buffer)
+                            total_nodes += stats.get("total_nodes", 0)
+                            total_relationships += stats.get("total_relationships", 0)
 
                     processed_chunks += batch_len
 
                 except Exception as e:
-                    print(f"⚠️ Batch failed: {e}")
+                    print(f"Batch failed: {e}")
                     failed_chunks += batch_len
 
-                # Update progress
                 if progress_callback:
-                    # Callback expects (processed_count, total_count)
                     progress_callback(processed_chunks + failed_chunks, len(docs))
+
+        if write_buffer:
+            stats = self._flush_graph_documents(write_buffer)
+            total_nodes += stats.get("total_nodes", 0)
+            total_relationships += stats.get("total_relationships", 0)
 
         return {
             "chunks_processed": processed_chunks,
             "chunks_failed": failed_chunks,
             "batches_processed": len(batches),
-            "graph_documents": len(all_graph_docs),
+            "graph_documents": graph_documents_count,
             "nodes_created": total_nodes,
             "relationships_created": total_relationships,
         }
@@ -235,8 +235,47 @@ class GraphService:
     def _process_single_batch(self, batch: List[Document]) -> List:
         """Process a single batch with rate limiting."""
         estimated_tokens = len(batch) * 2000
-        self.rate_limiter.acquire(estimated_tokens)
+        wait_time = self.rate_limiter.acquire(estimated_tokens)
+        if config.GRAPH_LOG_RATE_LIMIT_WAIT and wait_time > 1:
+            print(
+                f"Rate limiter waited {wait_time:.1f}s for batch size {len(batch)} "
+                f"(estimated tokens={estimated_tokens})"
+            )
         return self._process_batch_with_retry(batch)
+
+    def _resolve_concurrent_batch_size(self, total_docs: int, max_workers: int) -> int:
+        """
+        Resolve an adaptive batch size so smaller files can still use concurrency.
+
+        For small files, fixed large batches (e.g. 50) collapse to 1-2 batches and
+        run mostly serially. We target multiple batches per worker, then cap by the
+        configured maximum batch size.
+        """
+        configured_max = max(1, config.BATCH_SIZE_CHUNKS or 10)
+        if total_docs <= 0:
+            return configured_max
+
+        target_batches = max(
+            1,
+            max_workers * max(1, config.GRAPH_BATCHES_PER_WORKER),
+            config.GRAPH_MIN_BATCHES_PER_FILE,
+        )
+        adaptive_size = max(1, math.ceil(total_docs / target_batches))
+        return min(configured_max, adaptive_size)
+
+    def _flush_graph_documents(self, graph_docs: List) -> dict:
+        """Persist queued graph documents in larger writes for better throughput."""
+        if not graph_docs:
+            return {"total_nodes": 0, "total_relationships": 0}
+
+        payload = list(graph_docs)
+        graph_docs.clear()
+        print(f"Saving {len(payload)} graph documents to Neo4j...")
+        return self.neo4j_repo.add_graph_documents_batch(
+            payload,
+            batch_size=config.NEO4J_INGEST_BATCH_SIZE,
+            include_source=True,
+        )
 
     def query_graph(self, question: str) -> str:
         """Queries the knowledge graph using Cypher (legacy method)."""
@@ -415,3 +454,4 @@ class GraphService:
         return {
             "rate_limiter": self.rate_limiter.get_stats() if self.rate_limiter else {}
         }
+
