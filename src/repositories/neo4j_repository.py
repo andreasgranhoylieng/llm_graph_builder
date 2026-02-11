@@ -4,7 +4,7 @@ Enhanced with SOTA GraphRAG: bidirectional BFS, parallel multi-source BFS, graph
 """
 
 import hashlib
-import re
+import json
 from typing import List, Dict, Any, Optional, Set
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from langchain_neo4j import Neo4jGraph, GraphCypherQAChain
@@ -66,6 +66,7 @@ class Neo4jRepository(INeo4jRepository):
     def __init__(self):
         self._graph: Optional[Neo4jGraph] = None
         self._embeddings: Optional[OpenAIEmbeddings] = None
+        self._agent_llms: Dict[str, ChatOpenAI] = {}
 
     # =========================================================================
     # CONNECTION MANAGEMENT
@@ -99,6 +100,14 @@ class Neo4jRepository(INeo4jRepository):
                 model=config.EMBEDDING_MODEL, openai_api_key=config.OPENAI_API_KEY
             )
         return self._embeddings
+
+    def _get_agent_llm(self, agent_name: str) -> ChatOpenAI:
+        """Lazy initialization for role-specific LLM agents."""
+        if agent_name not in self._agent_llms:
+            self._agent_llms[agent_name] = ChatOpenAI(
+                temperature=0, model_name=config.LLM_MODEL
+            )
+        return self._agent_llms[agent_name]
 
     # =========================================================================
     # DOCUMENT INGESTION
@@ -999,66 +1008,439 @@ class Neo4jRepository(INeo4jRepository):
 
     def _decompose_question(self, question: str) -> List[str]:
         """
-        Split compound prompts into independent sub-questions.
-
-        This improves retrieval for mixed-topic prompts like:
-        "How much did X invest ... and what is the best model of Y?"
+        Use an LLM planner to split compound prompts into independent sub-questions.
+        Returns at most 15 questions for downstream retrieval.
         """
         max_sub_questions = 15
         normalized = " ".join((question or "").split())
         if not normalized:
             return []
 
-        def _normalize_segment(segment: str) -> str:
-            cleaned = segment.strip(" ,.;")
-            cleaned = re.sub(
-                r"^(and|also|plus|then)\s+",
-                "",
-                cleaned,
-                flags=re.IGNORECASE,
-            )
-            return cleaned.strip(" ,.;")
+        planner_prompt = f"""You are a query planning assistant for a graph RAG system.
 
-        # Explicit multi-question punctuation takes priority.
-        if normalized.count("?") > 1:
-            parts = []
-            for segment in re.split(r"\?\s*", normalized):
-                clean = _normalize_segment(segment)
-                if clean:
-                    parts.append(clean if clean.endswith("?") else f"{clean}?")
-            return parts[:max_sub_questions] if len(parts) > 1 else [normalized]
+Task:
+Split the user's message into atomic sub-questions for retrieval.
 
-        # Split on coordination when a new interrogative clause follows.
-        split_pattern = re.compile(
-            r"\s+(?:and|also|plus|then)\s+(?=(?:what|which|who|how|when|where|why|is|are|do|does|did|can|could|should|would|for)\b)",
-            flags=re.IGNORECASE,
-        )
-        candidates = [
-            _normalize_segment(segment)
-            for segment in split_pattern.split(normalized)
-            if _normalize_segment(segment)
-        ]
+Rules:
+1) Output STRICT JSON only with this shape:
+   {{"sub_questions": ["..."]}}
+2) Keep dependent clauses together when they belong to one fact request.
+   Example: "How much did Google invest in SpaceX and for how much ownership?"
+   should stay as ONE sub-question.
+3) Preserve original meaning and wording as much as possible.
+4) Return between 1 and {max_sub_questions} sub-questions.
+5) Remove duplicates.
+6) No markdown, no explanations.
 
-        if len(candidates) <= 1:
+User question:
+{normalized}
+"""
+
+        try:
+            llm = self._get_agent_llm("subquery_planner")
+            response = llm.invoke(planner_prompt)
+            content = response.content
+            if isinstance(content, list):
+                content = "".join(
+                    (
+                        item.get("text", "")
+                        if isinstance(item, dict)
+                        else str(item)
+                    )
+                    for item in content
+                )
+
+            text = str(content or "").strip()
+            if text.startswith("```"):
+                text = text.strip("`")
+                text = text.replace("json", "", 1).strip()
+
+            parsed = json.loads(text)
+            if isinstance(parsed, dict):
+                candidates = parsed.get("sub_questions", [])
+            elif isinstance(parsed, list):
+                candidates = parsed
+            else:
+                candidates = []
+
+            deduped: List[str] = []
+            seen = set()
+            for candidate in candidates:
+                if not isinstance(candidate, str):
+                    continue
+                cleaned = candidate.strip(" ,.;")
+                if not cleaned:
+                    continue
+                key = cleaned.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                deduped.append(cleaned)
+
+            return deduped[:max_sub_questions] if deduped else [normalized]
+        except Exception:
+            # Safety fallback when planner output is malformed/unavailable.
             return [normalized]
 
-        deduped: List[str] = []
-        seen = set()
-        for candidate in candidates:
-            key = candidate.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            deduped.append(candidate)
+    def _plan_document_retrieval(self, question: str) -> Dict[str, Any]:
+        """
+        Use an LLM planner to generate retrieval strategy for document chunks.
+        Returns semantic query variants and lexical hints without hard-coded rules.
+        """
+        normalized = " ".join((question or "").split()).strip()
+        if not normalized:
+            return {"semantic_queries": [], "lexical_keywords": [], "numeric_focus": False}
 
-        return deduped[:max_sub_questions] if deduped else [normalized]
+        planner_prompt = f"""You are a retrieval planner for a graph RAG system.
+
+Task:
+Produce a retrieval plan for the user's question.
+
+Output STRICT JSON only with this shape:
+{{
+  "semantic_queries": ["..."],
+  "lexical_keywords": ["..."],
+  "min_lexical_hits": 2,
+  "numeric_focus": false,
+  "rerank_terms": ["..."]
+}}
+
+Rules:
+1) Keep semantic_queries concise and high-signal (1-4 entries).
+2) lexical_keywords should be short literal tokens/phrases useful for exact text matching.
+3) Set numeric_focus=true if the question requests exact numbers, amounts, percentages, counts, dates, or rankings.
+4) min_lexical_hits must be an integer between 1 and 4.
+5) rerank_terms should contain the most discriminative evidence terms.
+6) No markdown. No explanation text.
+
+User question:
+{normalized}
+"""
+
+        fallback_plan = {
+            "semantic_queries": [normalized],
+            "lexical_keywords": [],
+            "min_lexical_hits": 2,
+            "numeric_focus": False,
+            "rerank_terms": [],
+        }
+
+        try:
+            llm = self._get_agent_llm("retrieval_planner")
+            response = llm.invoke(planner_prompt)
+            content = response.content
+            if isinstance(content, list):
+                content = "".join(
+                    (
+                        item.get("text", "")
+                        if isinstance(item, dict)
+                        else str(item)
+                    )
+                    for item in content
+                )
+
+            text = str(content or "").strip()
+            if text.startswith("```"):
+                text = text.strip("`")
+                text = text.replace("json", "", 1).strip()
+
+            parsed = json.loads(text)
+            if not isinstance(parsed, dict):
+                return fallback_plan
+
+            semantic_queries = parsed.get("semantic_queries", [])
+            lexical_keywords = parsed.get("lexical_keywords", [])
+            rerank_terms = parsed.get("rerank_terms", [])
+            min_lexical_hits = parsed.get("min_lexical_hits", 2)
+            numeric_focus = bool(parsed.get("numeric_focus", False))
+
+            if not isinstance(semantic_queries, list):
+                semantic_queries = []
+            if not isinstance(lexical_keywords, list):
+                lexical_keywords = []
+            if not isinstance(rerank_terms, list):
+                rerank_terms = []
+
+            def _clean_strings(items: List[Any], max_items: int) -> List[str]:
+                cleaned: List[str] = []
+                seen = set()
+                for item in items:
+                    if not isinstance(item, str):
+                        continue
+                    value = item.strip()
+                    if not value:
+                        continue
+                    key = value.lower()
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    cleaned.append(value)
+                    if len(cleaned) >= max_items:
+                        break
+                return cleaned
+
+            semantic_queries = _clean_strings(semantic_queries, 4)
+            lexical_keywords = _clean_strings(lexical_keywords, 12)
+            rerank_terms = _clean_strings(rerank_terms, 12)
+
+            if not semantic_queries:
+                semantic_queries = [normalized]
+
+            try:
+                min_lexical_hits = int(min_lexical_hits)
+            except Exception:
+                min_lexical_hits = 2
+            min_lexical_hits = min(4, max(1, min_lexical_hits))
+
+            return {
+                "semantic_queries": semantic_queries,
+                "lexical_keywords": lexical_keywords,
+                "min_lexical_hits": min_lexical_hits,
+                "numeric_focus": numeric_focus,
+                "rerank_terms": rerank_terms,
+            }
+        except Exception:
+            return fallback_plan
+
+    def _curate_document_evidence(
+        self,
+        question: str,
+        chunks: List[Dict[str, Any]],
+        max_chunks: int = 12,
+    ) -> Dict[str, Any]:
+        """
+        Evidence curator agent:
+        Select and order the most relevant chunks and extract concise evidence snippets.
+        """
+        if not chunks:
+            return {"chunks": [], "evidence_snippets": []}
+
+        candidates = []
+        for chunk in chunks[:30]:
+            content = str(chunk.get("content", "") or "")
+            preview = content[:600] + ("..." if len(content) > 600 else "")
+            candidates.append(
+                {
+                    "id": str(chunk.get("id", "")),
+                    "source": self._format_chunk_source(chunk),
+                    "score": float(chunk.get("score", 0) or 0),
+                    "preview": preview,
+                }
+            )
+
+        planner_prompt = f"""You are an evidence curator agent for a graph RAG pipeline.
+
+Question:
+{question}
+
+Candidate chunks (JSON):
+{json.dumps(candidates, ensure_ascii=True)}
+
+Task:
+1) Select the chunk ids that contain the strongest direct evidence for answering the question.
+2) Order selected_chunk_ids from strongest to weakest.
+3) Provide short evidence snippets tied to selected chunks.
+
+Output STRICT JSON:
+{{
+  "selected_chunk_ids": ["chunk_id_1", "chunk_id_2"],
+  "evidence_snippets": [
+    {{"chunk_id": "chunk_id_1", "text": "short evidence statement"}}
+  ]
+}}
+
+Rules:
+- Return 1 to {max_chunks} selected_chunk_ids.
+- Use only ids from the candidate list.
+- Snippets must be concise (<= 220 chars each) and evidence-grounded.
+- No markdown, no explanations outside JSON.
+"""
+
+        fallback_chunks = sorted(
+            [dict(item) for item in chunks],
+            key=lambda item: float(item.get("score", 0) or 0),
+            reverse=True,
+        )[:max_chunks]
+
+        try:
+            llm = self._get_agent_llm("evidence_curator")
+            response = llm.invoke(planner_prompt)
+            content = response.content
+            if isinstance(content, list):
+                content = "".join(
+                    (
+                        item.get("text", "")
+                        if isinstance(item, dict)
+                        else str(item)
+                    )
+                    for item in content
+                )
+
+            text = str(content or "").strip()
+            if text.startswith("```"):
+                text = text.strip("`")
+                text = text.replace("json", "", 1).strip()
+
+            parsed = json.loads(text)
+            if not isinstance(parsed, dict):
+                return {"chunks": fallback_chunks, "evidence_snippets": []}
+
+            selected_ids_raw = parsed.get("selected_chunk_ids", [])
+            snippets_raw = parsed.get("evidence_snippets", [])
+
+            chunk_map = {str(chunk.get("id", "")): dict(chunk) for chunk in chunks}
+            selected_ids: List[str] = []
+            seen = set()
+            for item in selected_ids_raw if isinstance(selected_ids_raw, list) else []:
+                if not isinstance(item, str):
+                    continue
+                key = item.strip()
+                if not key or key in seen or key not in chunk_map:
+                    continue
+                seen.add(key)
+                selected_ids.append(key)
+                if len(selected_ids) >= max_chunks:
+                    break
+
+            curated_chunks = [chunk_map[item] for item in selected_ids]
+            if not curated_chunks:
+                curated_chunks = fallback_chunks
+            elif len(curated_chunks) < max_chunks:
+                for chunk in fallback_chunks:
+                    chunk_id = str(chunk.get("id", ""))
+                    if chunk_id and chunk_id not in selected_ids:
+                        curated_chunks.append(chunk)
+                    if len(curated_chunks) >= max_chunks:
+                        break
+
+            evidence_snippets: List[str] = []
+            if isinstance(snippets_raw, list):
+                for snippet in snippets_raw:
+                    if not isinstance(snippet, dict):
+                        continue
+                    chunk_id = str(snippet.get("chunk_id", "")).strip()
+                    text_value = str(snippet.get("text", "")).strip()
+                    if not chunk_id or not text_value:
+                        continue
+                    if chunk_id not in chunk_map:
+                        continue
+                    source = self._format_chunk_source(chunk_map[chunk_id])
+                    short_text = text_value[:220] + ("..." if len(text_value) > 220 else "")
+                    bullet = f"- {short_text} (source: {source})"
+                    if bullet not in evidence_snippets:
+                        evidence_snippets.append(bullet)
+                    if len(evidence_snippets) >= max_chunks:
+                        break
+
+            return {"chunks": curated_chunks[:max_chunks], "evidence_snippets": evidence_snippets}
+        except Exception:
+            return {"chunks": fallback_chunks, "evidence_snippets": []}
+
+    def _keyword_search_documents(
+        self, keywords: List[str], top_k: int = 8, min_hits: int = 2
+    ) -> List[Dict[str, Any]]:
+        """Fallback lexical search over document chunks for high-precision fact retrieval."""
+        cleaned_keywords = []
+        seen = set()
+        for keyword in keywords:
+            kw = keyword.strip().lower()
+            if len(kw) < 3 or kw in seen:
+                continue
+            seen.add(kw)
+            cleaned_keywords.append(kw)
+
+        if not cleaned_keywords:
+            return []
+
+        graph = self._get_graph()
+        cypher = """
+        MATCH (d:Document)
+        WITH d, [k IN ['text', 'page_content', 'content'] WHERE k IN keys(d)] as content_keys
+        WITH d, CASE
+            WHEN size(content_keys) > 0 THEN toString(d[content_keys[0]])
+            ELSE ''
+        END as raw_content
+        WITH d, raw_content, toLower(raw_content) as lowered_content
+        WITH d, raw_content, lowered_content,
+             reduce(
+                score = 0,
+                kw IN $keywords |
+                score + CASE WHEN lowered_content CONTAINS kw THEN 1 ELSE 0 END
+             ) as hit_count
+        WHERE hit_count >= $min_hits
+        RETURN
+            d.id as id,
+            raw_content as content,
+            toString(COALESCE(d.source_file, d.source, '')) as source_file,
+            toString(COALESCE(d.source_path, '')) as source_path,
+            COALESCE(toInteger(d.page), -1) as page,
+            toFloat(hit_count) / toFloat(size($keywords)) as score
+        ORDER BY score DESC
+        LIMIT $top_k
+        """
+
+        try:
+            results = graph.query(
+                cypher,
+                params={
+                    "keywords": cleaned_keywords,
+                    "min_hits": max(1, min_hits),
+                    "top_k": max(1, top_k),
+                },
+            )
+            return results or []
+        except Exception as e:
+            print(f"Keyword document search failed: {e}")
+            return []
+
+    def _merge_evidence_snippets(
+        self, grouped_snippets: List[List[str]], max_snippets: int = 12
+    ) -> List[str]:
+        """Merge and deduplicate evidence snippets from multiple sub-query contexts."""
+        merged: List[str] = []
+        seen = set()
+
+        for snippets in grouped_snippets:
+            for snippet in snippets:
+                if not isinstance(snippet, str):
+                    continue
+                clean = snippet.strip()
+                if not clean or clean in seen:
+                    continue
+                seen.add(clean)
+                merged.append(clean)
+                if len(merged) >= max_snippets:
+                    return merged
+
+        return merged
 
     def _retrieve_hybrid_context(self, question: str, top_k: int = 10) -> Dict[str, Any]:
         """Run retrieval/expansion/reranking for one question segment."""
         entities = self.vector_search(
             question, top_k=top_k, score_threshold=config.VECTOR_SEARCH_SCORE_THRESHOLD
         )
-        doc_chunks = self.vector_search_documents(question, top_k=5)
+        retrieval_plan = self._plan_document_retrieval(question)
+        doc_query_variants = retrieval_plan.get("semantic_queries", []) or [question]
+        doc_chunk_groups = [
+            self.vector_search_documents(query_variant, top_k=7)
+            for query_variant in doc_query_variants
+        ]
+        lexical_keywords = retrieval_plan.get("lexical_keywords", [])
+        if lexical_keywords:
+            lexical_hits = self._keyword_search_documents(
+                lexical_keywords,
+                top_k=8,
+                min_hits=retrieval_plan.get("min_lexical_hits", 2),
+            )
+            if lexical_hits:
+                doc_chunk_groups.append(lexical_hits)
+
+        doc_chunks = self._merge_doc_chunks(doc_chunk_groups, max_chunks=20)
+        curation = self._curate_document_evidence(
+            question, doc_chunks, max_chunks=12
+        )
+        doc_chunks = curation.get("chunks", []) or []
+        evidence_snippets = curation.get("evidence_snippets", []) or []
 
         seed_ids = [e["id"] for e in entities[:5] if e.get("id")]
         expanded_subgraph = {"nodes": [], "relationships": [], "bridge_nodes": []}
@@ -1091,6 +1473,7 @@ class Neo4jRepository(INeo4jRepository):
             "question": question,
             "entities": entities,
             "doc_chunks": doc_chunks,
+            "evidence_snippets": evidence_snippets,
             "expanded_subgraph": expanded_subgraph,
         }
 
@@ -1136,6 +1519,11 @@ class Neo4jRepository(INeo4jRepository):
         """Merge and deduplicate document chunks by chunk id/content."""
         merged: Dict[str, Dict[str, Any]] = {}
 
+        def _chunk_rank_value(chunk: Dict[str, Any]) -> float:
+            if chunk.get("_hybrid_score") is not None:
+                return float(chunk.get("_hybrid_score", 0) or 0)
+            return float(chunk.get("score", 0) or 0)
+
         for chunks in grouped_chunks:
             for chunk in chunks:
                 chunk_id = chunk.get("id")
@@ -1148,11 +1536,11 @@ class Neo4jRepository(INeo4jRepository):
                 existing = merged.get(key)
                 if (
                     existing is None
-                    or chunk.get("score", 0) > existing.get("score", 0)
+                    or _chunk_rank_value(chunk) > _chunk_rank_value(existing)
                 ):
                     merged[key] = dict(chunk)
 
-        deduped = sorted(merged.values(), key=lambda item: item.get("score", 0), reverse=True)
+        deduped = sorted(merged.values(), key=_chunk_rank_value, reverse=True)
         return deduped[:max_chunks]
 
     def _merge_expanded_subgraphs(
@@ -1198,6 +1586,32 @@ class Neo4jRepository(INeo4jRepository):
             return f"{source_name} p.{page + 1}"
         return str(source_name)
 
+    def _synthesize_hybrid_answer(self, question: str, context_str: str) -> str:
+        """Answer synthesizer agent for final response generation."""
+        llm = self._get_agent_llm("answer_synthesizer")
+        prompt = f"""Based on the following knowledge from a knowledge graph and source documents, answer the user's question.
+
+The information includes:
+- Source documents (raw text from original files)
+- Key entities found via semantic search, ranked by combined vector similarity and graph proximity
+- Bridge entities that connect multiple topics in the knowledge graph
+- Expanded graph context showing related entities discovered through graph traversal
+- Relationship chains showing how entities are connected
+
+{context_str}
+
+Question: {question}
+
+Instructions:
+- If the question contains multiple parts, answer each part explicitly in a numbered list.
+- Prefer exact values from source documents when available.
+- Include source attribution like "(source: SpaceX.pdf p.5)" for key facts when possible.
+- If a part of the question is not grounded in retrieved evidence, state that clearly.
+
+Answer:"""
+        response = llm.invoke(prompt)
+        return response.content
+
     def query_hybrid(self, question: str, top_k: int = 10) -> Dict[str, Any]:
         """
         SOTA Hybrid query combining vector search, parallel BFS expansion,
@@ -1234,11 +1648,15 @@ class Neo4jRepository(INeo4jRepository):
             [ctx.get("entities", []) for ctx in contexts_with_hits]
         )
         doc_chunk_budget = (
-            min(15, max(5, len(sub_questions) * 2)) if len(sub_questions) > 1 else 5
+            min(18, max(8, len(sub_questions) * 4)) if len(sub_questions) > 1 else 6
         )
         doc_chunks = self._merge_doc_chunks(
             [ctx.get("doc_chunks", []) for ctx in contexts_with_hits],
             max_chunks=doc_chunk_budget,
+        )
+        evidence_snippets = self._merge_evidence_snippets(
+            [ctx.get("evidence_snippets", []) for ctx in contexts_with_hits],
+            max_snippets=min(15, max(6, len(sub_questions) * 3)),
         )
         expanded_subgraph = self._merge_expanded_subgraphs(
             [ctx.get("expanded_subgraph", {}) for ctx in contexts_with_hits]
@@ -1256,7 +1674,7 @@ class Neo4jRepository(INeo4jRepository):
         # Document chunks (highest fidelity source)
         if doc_chunks:
             context_parts.append("## Relevant Source Documents:")
-            doc_limit = min(len(doc_chunks), max(3, len(sub_questions) * 2))
+            doc_limit = min(len(doc_chunks), max(4, len(sub_questions) * 3))
             content_limit = 500 if len(sub_questions) >= 4 else 800
             for chunk in doc_chunks[:doc_limit]:
                 content = chunk.get("content", "")
@@ -1268,6 +1686,9 @@ class Neo4jRepository(INeo4jRepository):
                     )
                     source = self._format_chunk_source(chunk)
                     context_parts.append(f"Source: {source}\n```\n{content}\n```")
+            if evidence_snippets:
+                context_parts.append("\n## Evidence Snippets:")
+                context_parts.extend(evidence_snippets)
 
         # Reranked entity context
         if entities:
@@ -1334,34 +1755,9 @@ class Neo4jRepository(INeo4jRepository):
 
         context_str = "\n".join(context_parts)
 
-        # LLM synthesis
-        llm = ChatOpenAI(temperature=0, model_name=config.LLM_MODEL)
-
-        prompt = f"""Based on the following knowledge from a knowledge graph and source documents, answer the user's question.
-
-The information includes:
-- Source documents (raw text from original files)
-- Key entities found via semantic search, ranked by combined vector similarity and graph proximity
-- Bridge entities that connect multiple topics in the knowledge graph
-- Expanded graph context showing related entities discovered through graph traversal
-- Relationship chains showing how entities are connected
-
-{context_str}
-
-Question: {question}
-
-Instructions:
-- If the question contains multiple parts, answer each part explicitly in a numbered list.
-- Prefer exact numeric values from source documents when available.
-- Include source attribution like "(source: SpaceX.pdf p.5)" for key facts when possible.
-- If a part of the question is not grounded in retrieved evidence, state that clearly.
-
-Answer:"""
-
         llm_failed = False
         try:
-            response = llm.invoke(prompt)
-            answer = response.content
+            answer = self._synthesize_hybrid_answer(question, context_str)
         except Exception as e:
             llm_failed = True
             answer = f"Error generating answer: {e}"

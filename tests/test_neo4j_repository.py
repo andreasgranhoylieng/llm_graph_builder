@@ -226,8 +226,25 @@ class TestGraphTraversal:
 class TestHybridQuery:
     """Tests for hybrid query functionality."""
 
-    def test_decompose_question_supports_more_than_five_sub_questions(self):
-        """Compound prompts should decompose into all detected sub-questions up to the cap."""
+    @patch("src.repositories.neo4j_repository.ChatOpenAI")
+    def test_decompose_question_uses_llm_planner(self, mock_chat_openai):
+        """Compound prompts should be decomposed by the LLM planner output."""
+        llm_instance = MagicMock()
+        mock_chat_openai.return_value = llm_instance
+        llm_response = MagicMock()
+        llm_response.content = """
+        {
+          "sub_questions": [
+            "How much did Google invest in SpaceX and for how much ownership?",
+            "What model of Claude is best?",
+            "Who created Claude?",
+            "When was Claude released?",
+            "Where is Anthropic based?"
+          ]
+        }
+        """
+        llm_instance.invoke.return_value = llm_response
+
         repo = Neo4jRepository()
         question = (
             "How much did Google invest in SpaceX and for how much ownership, "
@@ -237,8 +254,80 @@ class TestHybridQuery:
 
         parts = repo._decompose_question(question)
 
-        assert len(parts) == 6
-        assert not any(part.lower().startswith("and ") for part in parts)
+        assert len(parts) == 5
+        assert parts[0].lower().startswith("how much did google invest in spacex")
+        llm_instance.invoke.assert_called_once()
+
+    @patch("src.repositories.neo4j_repository.ChatOpenAI")
+    def test_plan_document_retrieval_uses_llm_agent(self, mock_chat_openai):
+        """Retrieval planning should be produced by an LLM agent JSON plan."""
+        llm_instance = MagicMock()
+        mock_chat_openai.return_value = llm_instance
+        llm_response = MagicMock()
+        llm_response.content = """
+        {
+          "semantic_queries": ["Google SpaceX investment ownership", "Claude best model"],
+          "lexical_keywords": ["Google", "SpaceX", "ownership", "Claude", "Opus"],
+          "min_lexical_hits": 2,
+          "numeric_focus": true,
+          "rerank_terms": ["investment", "ownership", "best model"]
+        }
+        """
+        llm_instance.invoke.return_value = llm_response
+
+        repo = Neo4jRepository()
+        plan = repo._plan_document_retrieval("How much did Google invest in SpaceX?")
+
+        assert len(plan["semantic_queries"]) == 2
+        assert "Google" in plan["lexical_keywords"]
+        assert plan["numeric_focus"] is True
+        llm_instance.invoke.assert_called_once()
+
+    @patch("src.repositories.neo4j_repository.ChatOpenAI")
+    def test_curate_document_evidence_uses_llm_agent_selection(self, mock_chat_openai):
+        """Evidence curation should follow selected chunk ids from the curator agent."""
+        llm_instance = MagicMock()
+        mock_chat_openai.return_value = llm_instance
+        llm_response = MagicMock()
+        llm_response.content = """
+        {
+          "selected_chunk_ids": ["fact-1"],
+          "evidence_snippets": [
+            {
+              "chunk_id": "fact-1",
+              "text": "SpaceX raised $1 billion from Google and Fidelity for 8.33%."
+            }
+          ]
+        }
+        """
+        llm_instance.invoke.return_value = llm_response
+
+        repo = Neo4jRepository()
+        chunks = [
+            {
+                "id": "ref-1",
+                "content": "Reference-heavy citation block.",
+                "source_file": "SpaceX.pdf",
+                "page": 58,
+                "score": 0.92,
+            },
+            {
+                "id": "fact-1",
+                "content": "In January 2015, SpaceX raised $1 billion in funding from Google and Fidelity Investments, in exchange for 8.33% of the company.",
+                "source_file": "SpaceX.pdf",
+                "page": 4,
+                "score": 0.88,
+            },
+        ]
+
+        curated = repo._curate_document_evidence(
+            "How much did Google invest in SpaceX and for how much ownership?",
+            chunks,
+            max_chunks=2,
+        )
+
+        assert curated["chunks"][0]["id"] == "fact-1"
+        assert curated["evidence_snippets"]
 
     def test_hybrid_query_with_matches(
         self, mock_neo4j_graph, mock_embeddings, sample_entities, sample_neighbors
