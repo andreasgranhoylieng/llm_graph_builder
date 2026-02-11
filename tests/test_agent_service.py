@@ -95,6 +95,28 @@ def test_ask_success(mock_create_agent, mock_chat, agent_service):
 
 @patch("src.services.agent_service.ChatOpenAI")
 @patch("src.services.agent_service.create_agent")
+def test_ask_extracts_context_source_content(mock_create_agent, mock_chat, agent_service):
+    # Setup
+    mock_graph = mock_create_agent.return_value
+    tool_msg_context = ToolMessage(
+        content="**GPT-4**: A model by OpenAI", tool_call_id="ctx1", name="get_entity_context"
+    )
+    ai_msg = AIMessage(content="GPT-4 is an OpenAI model.")
+    mock_graph.invoke.return_value = {"messages": [tool_msg_context, ai_msg]}
+
+    # Execute
+    response = agent_service.ask("Tell me about GPT-4")
+
+    # Verify
+    assert response["status"] == "success"
+    context_sources = [s for s in response.get("sources", []) if s["type"] == "context"]
+    assert context_sources
+    assert "GPT-4" in context_sources[0]["content"]
+    assert "tool_call_id" not in context_sources[0]["content"]
+
+
+@patch("src.services.agent_service.ChatOpenAI")
+@patch("src.services.agent_service.create_agent")
 def test_ask_error(mock_create_agent, mock_chat, agent_service):
     # Setup
     mock_graph = mock_create_agent.return_value

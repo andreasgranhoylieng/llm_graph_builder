@@ -3,6 +3,7 @@ Neo4j Repository - Comprehensive graph database operations with vector search an
 Enhanced with SOTA GraphRAG: bidirectional BFS, parallel multi-source BFS, graph-aware reranking.
 """
 
+import hashlib
 from typing import List, Dict, Any, Optional, Set
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from langchain_neo4j import Neo4jGraph, GraphCypherQAChain
@@ -154,16 +155,18 @@ class Neo4jRepository(INeo4jRepository):
                 )
 
                 # --- ENTITY EMBEDDING GENERATION ---
-                nodes_to_embed = {}  # id -> {type, description}
+                nodes_to_embed = {}  # id -> {name, description}
                 for g_doc in batch:
                     for node in g_doc.nodes:
                         if node.id not in nodes_to_embed:
                             # Extract description from properties if available
+                            name = str(node.id)
                             description = ""
                             if hasattr(node, "properties") and node.properties:
+                                name = node.properties.get("name") or name
                                 description = node.properties.get("description", "")
                             nodes_to_embed[node.id] = {
-                                "type": node.type,
+                                "name": name,
                                 "description": description,
                             }
 
@@ -172,11 +175,12 @@ class Neo4jRepository(INeo4jRepository):
                     node_ids = list(nodes_to_embed.keys())
                     texts_to_embed = []
                     for nid in node_ids:
+                        name = nodes_to_embed[nid]["name"]
                         desc = nodes_to_embed[nid]["description"]
                         if desc:
-                            texts_to_embed.append(f"{nid}: {desc}")
+                            texts_to_embed.append(f"{name}: {desc}")
                         else:
-                            texts_to_embed.append(nid)
+                            texts_to_embed.append(name)
 
                     embeddings = self._get_embeddings().embed_documents(texts_to_embed)
 
@@ -197,12 +201,22 @@ class Neo4jRepository(INeo4jRepository):
                 docs_to_embed = []
                 for g_doc in batch:
                     if hasattr(g_doc, "source") and g_doc.source:
-                        doc_id = g_doc.source.metadata.get(
-                            "id"
-                        ) or g_doc.source.metadata.get("source")
+                        metadata = g_doc.source.metadata or {}
+                        source_name = metadata.get("source") or metadata.get(
+                            "source_file", "unknown"
+                        )
+                        page = metadata.get("page", 0)
+                        chunk_id = metadata.get("chunk_id") or metadata.get("id")
                         doc_content = g_doc.source.page_content
-                        if doc_id and doc_content:
-                            docs_to_embed.append({"id": doc_id, "content": doc_content})
+                        if not chunk_id and doc_content:
+                            content_hash = hashlib.md5(
+                                doc_content.encode("utf-8")
+                            ).hexdigest()[:12]
+                            chunk_id = f"{source_name}#p{page}:{content_hash}"
+                        if chunk_id and doc_content:
+                            docs_to_embed.append(
+                                {"id": chunk_id, "content": doc_content}
+                            )
 
                 if docs_to_embed:
                     doc_contents = [d["content"] for d in docs_to_embed]
@@ -258,19 +272,11 @@ class Neo4jRepository(INeo4jRepository):
         graph = self._get_graph()
         query_embedding = self._get_embeddings().embed_query(query)
 
-        # Build label filter if specified
-        label_filter = ""
-        if node_labels:
-            labels_str = " OR ".join(
-                [f"'{label}' IN labels(node)" for label in node_labels]
-            )
-            label_filter = f"WHERE ({labels_str})"
-
-        cypher = f"""
+        cypher = """
         CALL db.index.vector.queryNodes('entity_embeddings', $top_k, $embedding)
         YIELD node, score
-        {label_filter}
         WHERE score >= $threshold
+          AND ($node_labels IS NULL OR size($node_labels) = 0 OR ANY(label IN labels(node) WHERE label IN $node_labels))
         RETURN 
             node.id as id,
             COALESCE(node.name, node.id) as name,
@@ -287,6 +293,7 @@ class Neo4jRepository(INeo4jRepository):
                     "embedding": query_embedding,
                     "top_k": top_k,
                     "threshold": score_threshold,
+                    "node_labels": node_labels or [],
                 },
             )
             return results or []
@@ -304,9 +311,13 @@ class Neo4jRepository(INeo4jRepository):
         cypher = """
         CALL db.index.vector.queryNodes('document_embeddings', $top_k, $embedding)
         YIELD node, score
+        WITH node, score, [k IN ['text', 'page_content', 'content'] WHERE k IN keys(node)] as content_keys
         RETURN 
             node.id as id,
-            node.text as content,
+            CASE
+                WHEN size(content_keys) > 0 THEN toString(node[content_keys[0]])
+                ELSE ''
+            END as content,
             score
         ORDER BY score DESC
         """
@@ -609,10 +620,11 @@ class Neo4jRepository(INeo4jRepository):
                 pass  # APOC not available
 
             # Fallback: variable-length path expansion
-            fallback_cypher = f"""
-            MATCH (center {{id: $seed_id}})-[r*0..{max_depth}]-(connected)
-            WITH DISTINCT connected,
-                 [rel IN r | type(rel)] as rel_types
+            fallback_nodes_cypher = f"""
+            MATCH (center {{id: $seed_id}})
+            OPTIONAL MATCH (center)-[*0..{max_depth}]-(connected)
+            WITH connected
+            WHERE connected IS NOT NULL
             RETURN
                 collect(DISTINCT {{
                     id: connected.id,
@@ -621,11 +633,29 @@ class Neo4jRepository(INeo4jRepository):
                     description: connected.description
                 }}) as nodes
             """
+            fallback_relationships_cypher = f"""
+            MATCH (center {{id: $seed_id}})
+            OPTIONAL MATCH path = (center)-[r*1..{max_depth}]-()
+            UNWIND r as rel
+            RETURN
+                collect(DISTINCT {{
+                    type: type(rel),
+                    start: startNode(rel).id,
+                    end: endNode(rel).id
+                }}) as relationships
+            """
             try:
-                results = graph.query(fallback_cypher, params={"seed_id": seed_id})
+                node_results = graph.query(
+                    fallback_nodes_cypher, params={"seed_id": seed_id}
+                )
+                rel_results = graph.query(
+                    fallback_relationships_cypher, params={"seed_id": seed_id}
+                )
                 return {
-                    "nodes": results[0]["nodes"] if results else [],
-                    "relationships": [],
+                    "nodes": node_results[0]["nodes"] if node_results else [],
+                    "relationships": rel_results[0]["relationships"]
+                    if rel_results
+                    else [],
                 }
             except Exception as e:
                 print(f"Seed expansion failed for {seed_id}: {e}")
@@ -703,6 +733,10 @@ class Neo4jRepository(INeo4jRepository):
 
         graph = self._get_graph()
         entity_ids = [e.get("id") for e in entities if e.get("id")]
+        query_id_set = {qid for qid in query_entity_ids if qid}
+        distance_map = {eid: 0 for eid in entity_ids if eid in query_id_set}
+        query_ids_for_db = [qid for qid in query_id_set]
+        entity_ids_for_db = [eid for eid in entity_ids if eid not in query_id_set]
 
         # Batch query: get shortest path lengths from each entity to any query entity
         proximity_cypher = """
@@ -716,18 +750,21 @@ class Neo4jRepository(INeo4jRepository):
         """
 
         try:
-            results = graph.query(
-                proximity_cypher,
-                params={"entity_ids": entity_ids, "query_ids": query_entity_ids},
-            )
+            if entity_ids_for_db and query_ids_for_db:
+                results = graph.query(
+                    proximity_cypher,
+                    params={
+                        "entity_ids": entity_ids_for_db,
+                        "query_ids": query_ids_for_db,
+                    },
+                )
 
-            # Build distance map
-            distance_map = {}
-            for row in results:
-                eid = row.get("eid")
-                dist = row.get("min_distance")
-                if eid is not None:
-                    distance_map[eid] = dist
+                # Build distance map
+                for row in results:
+                    eid = row.get("eid")
+                    dist = row.get("min_distance")
+                    if eid is not None:
+                        distance_map[eid] = dist
 
         except Exception as e:
             print(f"Graph reranking proximity query failed: {e}")
@@ -799,19 +836,35 @@ class Neo4jRepository(INeo4jRepository):
 
         # Fallback without APOC
         fallback_cypher = f"""
-        MATCH (center {{id: $center_id}})-[r*0..{max_depth}]-(connected)
-        WITH DISTINCT connected, r
-        RETURN 
-            collect(DISTINCT {{
-                id: connected.id,
-                name: COALESCE(connected.name, connected.id),
-                labels: labels(connected),
-                description: connected.description
-            }}) as nodes
+        MATCH (center {{id: $center_id}})
+        OPTIONAL MATCH (center)-[*0..{max_depth}]-(connected)
+        WITH center, collect(DISTINCT {{
+            id: connected.id,
+            name: COALESCE(connected.name, connected.id),
+            labels: labels(connected),
+            description: connected.description
+        }}) as nodes
+        CALL {{
+            WITH center
+            OPTIONAL MATCH path = (center)-[r*1..{max_depth}]-()
+            UNWIND r as rel
+            RETURN collect(DISTINCT {{
+                type: type(rel),
+                start: startNode(rel).id,
+                end: endNode(rel).id,
+                properties: properties(rel)
+            }}) as relationships
+        }}
+        RETURN nodes, relationships
         """
 
         results = graph.query(fallback_cypher, params={"center_id": center_id})
-        return {"nodes": results[0]["nodes"] if results else [], "relationships": []}
+        if results:
+            return {
+                "nodes": results[0].get("nodes", []),
+                "relationships": results[0].get("relationships", []),
+            }
+        return {"nodes": [], "relationships": []}
 
     # =========================================================================
     # HYBRID QUERY
@@ -971,10 +1024,12 @@ Provide a clear, comprehensive answer. Prioritize information from source docume
 
 Answer:"""
 
+        llm_failed = False
         try:
             response = llm.invoke(prompt)
             answer = response.content
         except Exception as e:
+            llm_failed = True
             answer = f"Error generating answer: {e}"
 
         # Confidence: blend of vector score, graph proximity, and doc coverage
@@ -991,6 +1046,9 @@ Answer:"""
         else:
             confidence = 0.3
 
+        if llm_failed:
+            confidence = min(confidence, 0.2)
+
         return {
             "answer": answer,
             "entities_found": entities,
@@ -999,6 +1057,7 @@ Answer:"""
             "doc_chunks_used": len(doc_chunks),
             "confidence": round(confidence, 3),
             "method": "hybrid_sota",
+            "status": "error" if llm_failed else "success",
         }
 
     def query(self, question: str) -> str:

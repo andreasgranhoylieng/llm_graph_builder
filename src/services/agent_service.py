@@ -269,7 +269,11 @@ class AgentService:
             messages = result.get("messages", [])
             last_message = messages[-1] if messages else None
 
-            answer = last_message.content if last_message else "No answer generated."
+            answer = (
+                self._coerce_message_content(last_message.content)
+                if last_message
+                else "No answer generated."
+            )
 
             # Extract sources from ToolMessages
             sources = []
@@ -277,29 +281,33 @@ class AgentService:
                 if isinstance(msg, ToolMessage):
                     if msg.name == "search_documents":
                         # Naive parsing of document search results
-                        content = msg.content
+                        content = self._coerce_message_content(msg.content)
                         if "Content:" in content:
                             parts = content.split("Content:")
                             for part in parts[1:]:
-                                clean_part = part.strip()[:200] + "..."
+                                snippet = part.strip()[:200]
+                                clean_part = snippet + ("..." if len(snippet) == 200 else "")
                                 sources.append(
                                     {"type": "document", "content": clean_part}
                                 )
                     elif msg.name == "search_vector_store":
                         # Naive parsing of entity search results
-                        lines = msg.content.split("\n")
+                        lines = self._coerce_message_content(msg.content).split("\n")
                         for line in lines:
                             if "Name:" in line:
                                 sources.append(
                                     {"type": "entity", "content": line.strip()}
                                 )
                     elif msg.name == "get_entity_context":
+                        content = self._coerce_message_content(msg.content).strip()
+                        if len(content) > 220:
+                            content = content[:220] + "..."
                         sources.append(
                             {
                                 "type": "context",
-                                "content": f"Context for {msg.tool_call_id}",
+                                "content": content or "Entity context returned by tool.",
                             }
-                        )  # Placeholder parsing
+                        )
 
             response = {"answer": answer, "sources": sources, "status": "success"}
 
@@ -313,6 +321,22 @@ class AgentService:
                 "status": "error",
                 "error": str(e),
             }
+
+    def _coerce_message_content(self, content: Any) -> str:
+        """Normalize LangChain message content into plain text."""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for item in content:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict):
+                    text = item.get("text")
+                    if text:
+                        parts.append(str(text))
+            return "\n".join(parts).strip()
+        return str(content) if content is not None else ""
 
     def _format_trace(self, messages: list) -> list:
         """

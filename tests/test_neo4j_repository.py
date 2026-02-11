@@ -69,9 +69,14 @@ class TestVectorSearch:
             repo = Neo4jRepository()
             repo.vector_search("test", node_labels=["AIModel", "AICompany"])
 
-            # Check that the query included label filter
             call_args = mock_neo4j_graph.query.call_args
             assert call_args is not None
+            query = call_args[0][0]
+            params = call_args[1]["params"]
+            assert "WHERE score >= $threshold" in query
+            assert "AND ($node_labels IS NULL" in query
+            assert "ANY(label IN labels(node)" in query
+            assert params["node_labels"] == ["AIModel", "AICompany"]
 
     def test_vector_search_handles_empty_results(
         self, mock_neo4j_graph, mock_embeddings
@@ -89,6 +94,29 @@ class TestVectorSearch:
             results = repo.vector_search("nonexistent entity")
 
             assert results == []
+
+    def test_vector_search_documents_returns_content_field(
+        self, mock_neo4j_graph, mock_embeddings
+    ):
+        """Document search should surface text via the normalized `content` field."""
+        with (
+            patch("src.repositories.neo4j_repository.Neo4jGraph") as neo4j_mock,
+            patch("src.repositories.neo4j_repository.OpenAIEmbeddings") as emb_mock,
+        ):
+            neo4j_mock.return_value = mock_neo4j_graph
+            emb_mock.return_value = mock_embeddings
+            mock_neo4j_graph.query.return_value = [
+                {"id": "doc1", "content": "Chunk text", "score": 0.9}
+            ]
+
+            repo = Neo4jRepository()
+            results = repo.vector_search_documents("test query", top_k=1)
+
+            assert results[0]["content"] == "Chunk text"
+            query = mock_neo4j_graph.query.call_args[0][0]
+            assert "keys(node)" in query
+            assert "node.page_content" not in query
+            assert "node.content" not in query
 
 
 class TestGraphTraversal:
@@ -168,6 +196,32 @@ class TestGraphTraversal:
             assert len(result["nodes"]) == 2
             assert result["relationships"][0]["type"] == "DEVELOPED_BY"
 
+    def test_get_subgraph_fallback_includes_relationships(self, mock_neo4j_graph):
+        """Fallback subgraph query should return relationships, not only nodes."""
+        with patch("src.repositories.neo4j_repository.Neo4jGraph") as neo4j_mock:
+            neo4j_mock.return_value = mock_neo4j_graph
+            mock_neo4j_graph.query.side_effect = [
+                Exception("APOC unavailable"),
+                [
+                    {
+                        "nodes": [
+                            {"id": "A", "name": "A", "labels": ["Entity"]},
+                            {"id": "B", "name": "B", "labels": ["Entity"]},
+                        ],
+                        "relationships": [
+                            {"type": "RELATED_TO", "start": "A", "end": "B"}
+                        ],
+                    }
+                ],
+            ]
+
+            repo = Neo4jRepository()
+            result = repo.get_subgraph("A", max_depth=2)
+
+            assert len(result["nodes"]) == 2
+            assert len(result["relationships"]) == 1
+            assert result["relationships"][0]["type"] == "RELATED_TO"
+
 
 class TestHybridQuery:
     """Tests for hybrid query functionality."""
@@ -204,6 +258,7 @@ class TestHybridQuery:
                         ]
                     }
                 ],  # seed 1 fallback
+                [{"relationships": []}],  # seed 1 fallback relationships
                 Exception("APOC"),  # seed 2 APOC attempt
                 [
                     {
@@ -217,6 +272,7 @@ class TestHybridQuery:
                         ]
                     }
                 ],  # seed 2 fallback
+                [{"relationships": []}],  # seed 2 fallback relationships
                 Exception("APOC"),  # seed 3 APOC attempt
                 [
                     {
@@ -230,6 +286,7 @@ class TestHybridQuery:
                         ]
                     }
                 ],  # seed 3 fallback
+                [{"relationships": []}],  # seed 3 fallback relationships
                 [
                     {"eid": "GPT-4", "min_distance": 0},
                     {"eid": "GPT-3.5", "min_distance": 1},
@@ -251,6 +308,62 @@ class TestHybridQuery:
             assert "answer" in result
             assert "entities_found" in result
             assert result["method"] == "hybrid_sota"
+            assert result["status"] == "success"
+
+    def test_hybrid_query_sets_low_confidence_on_llm_failure(
+        self, mock_neo4j_graph, mock_embeddings, sample_entities
+    ):
+        """LLM failures should not be reported with high confidence."""
+        with (
+            patch("src.repositories.neo4j_repository.Neo4jGraph") as neo4j_mock,
+            patch("src.repositories.neo4j_repository.OpenAIEmbeddings") as emb_mock,
+            patch("src.repositories.neo4j_repository.ChatOpenAI") as llm_mock,
+        ):
+            neo4j_mock.return_value = mock_neo4j_graph
+            emb_mock.return_value = mock_embeddings
+            mock_embeddings.embed_query.return_value = [0.1] * 3072
+
+            mock_neo4j_graph.query.side_effect = [
+                sample_entities,  # vector search
+                [],  # document search
+                Exception("APOC"),  # seed 1 APOC attempt
+                [{"nodes": [{"id": "GPT-4", "name": "GPT-4", "labels": ["AIModel"]}]}],
+                [{"relationships": []}],
+                Exception("APOC"),  # seed 2 APOC attempt
+                [
+                    {
+                        "nodes": [
+                            {"id": "GPT-3.5", "name": "GPT-3.5", "labels": ["AIModel"]}
+                        ]
+                    }
+                ],
+                [{"relationships": []}],
+                Exception("APOC"),  # seed 3 APOC attempt
+                [
+                    {
+                        "nodes": [
+                            {"id": "Claude-3", "name": "Claude-3", "labels": ["AIModel"]}
+                        ]
+                    }
+                ],
+                [{"relationships": []}],
+                [
+                    {"eid": "GPT-4", "min_distance": 0},
+                    {"eid": "GPT-3.5", "min_distance": 1},
+                    {"eid": "Claude-3", "min_distance": 2},
+                ],
+            ]
+
+            llm_instance = MagicMock()
+            llm_mock.return_value = llm_instance
+            llm_instance.invoke.side_effect = Exception("LLM failure")
+
+            repo = Neo4jRepository()
+            result = repo.query_hybrid("What is GPT-4?")
+
+            assert result["status"] == "error"
+            assert result["confidence"] <= 0.2
+            assert "Error generating answer" in result["answer"]
 
     def test_hybrid_query_falls_back_to_cypher(self, mock_neo4j_graph, mock_embeddings):
         """Test hybrid query falls back to Cypher when no vector matches."""
@@ -307,6 +420,29 @@ class TestEmbeddingGeneration:
 
             # The embedding should include the node name
             assert any("GPT-4" in text for text in texts)
+
+    def test_embeddings_prefer_cleaned_name_over_raw_id(self, sample_graph_document):
+        """Embedding text should use semantic name from properties when available."""
+        with (
+            patch("src.repositories.neo4j_repository.Neo4jGraph") as neo4j_mock,
+            patch("src.repositories.neo4j_repository.OpenAIEmbeddings") as emb_mock,
+        ):
+            mock_graph = MagicMock()
+            neo4j_mock.return_value = mock_graph
+
+            sample_graph_document.nodes[0].id = "https://example.com/some/very/long/node-id"
+            sample_graph_document.nodes[0].properties["name"] = "GPT-4"
+            sample_graph_document.nodes[0].properties["description"] = "LLM"
+
+            mock_embeddings = MagicMock()
+            emb_mock.return_value = mock_embeddings
+            mock_embeddings.embed_documents.return_value = [[0.1] * 3072, [0.1] * 3072]
+
+            repo = Neo4jRepository()
+            repo.add_graph_documents_batch([sample_graph_document])
+
+            texts = mock_embeddings.embed_documents.call_args_list[0][0][0]
+            assert any(text.startswith("GPT-4: LLM") for text in texts)
 
 
 class TestDatabaseManagement:
@@ -447,6 +583,13 @@ class TestParallelBFS:
                         ]
                     }
                 ],
+                [
+                    {
+                        "relationships": [
+                            {"type": "RELATED_TO", "start": "A", "end": "C"}
+                        ]
+                    }
+                ],
                 Exception("APOC"),  # seed 2 APOC attempt
                 [
                     {
@@ -466,6 +609,13 @@ class TestParallelBFS:
                         ]
                     }
                 ],
+                [
+                    {
+                        "relationships": [
+                            {"type": "RELATED_TO", "start": "B", "end": "C"}
+                        ]
+                    }
+                ],
             ]
 
             repo = Neo4jRepository()
@@ -477,6 +627,7 @@ class TestParallelBFS:
             assert "B" in node_ids
             assert "C" in node_ids
             assert len(node_ids) == 3
+            assert len(result["relationships"]) == 2
 
     def test_parallel_bfs_identifies_bridge_nodes(self, mock_neo4j_graph):
         """Test that bridge nodes (found from 2+ seeds) are correctly identified."""
@@ -502,6 +653,13 @@ class TestParallelBFS:
                         ]
                     }
                 ],
+                [
+                    {
+                        "relationships": [
+                            {"type": "RELATED_TO", "start": "seed1", "end": "bridge"}
+                        ]
+                    }
+                ],
                 Exception("APOC"),
                 [
                     {
@@ -518,6 +676,13 @@ class TestParallelBFS:
                                 "labels": ["E"],
                                 "description": "shared",
                             },
+                        ]
+                    }
+                ],
+                [
+                    {
+                        "relationships": [
+                            {"type": "RELATED_TO", "start": "seed2", "end": "bridge"}
                         ]
                     }
                 ],
@@ -554,6 +719,7 @@ class TestParallelBFS:
                         ]
                     }
                 ],
+                [{"relationships": []}],
             ]
 
             repo = Neo4jRepository()
@@ -622,3 +788,17 @@ class TestGraphRerank:
         assert repo.graph_rerank([{"id": "A", "score": 0.9}], []) == [
             {"id": "A", "score": 0.9}
         ]
+
+    def test_reranking_handles_same_start_end_without_db_error(self, mock_neo4j_graph):
+        """Entities identical to query IDs should get proximity 1.0 without shortestPath query."""
+        with patch("src.repositories.neo4j_repository.Neo4jGraph") as neo4j_mock:
+            neo4j_mock.return_value = mock_neo4j_graph
+            mock_neo4j_graph.query.return_value = []
+
+            entities = [{"id": "A", "score": 0.8, "name": "A"}]
+            repo = Neo4jRepository()
+            result = repo.graph_rerank(entities, query_entity_ids=["A"])
+
+            assert result[0]["graph_proximity"] == 1.0
+            assert result[0]["score"] > 0.8
+            assert mock_neo4j_graph.query.call_count == 0

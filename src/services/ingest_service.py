@@ -3,6 +3,7 @@ IngestService - Handles document loading and chunking with streaming support.
 """
 
 import os
+import hashlib
 from typing import List, Generator, Tuple, Optional
 from langchain_community.document_loaders import PyPDFLoader, TextLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -85,6 +86,7 @@ class IngestService:
 
             # Chunk documents
             chunks = self.text_splitter.split_documents(documents)
+            self._assign_chunk_metadata(chunks, file_path=file_path)
 
             return chunks, None
 
@@ -158,8 +160,33 @@ class IngestService:
             chunk_size=chunk_size, chunk_overlap=chunk_overlap
         )
         chunks = text_splitter.split_documents(documents)
+        self._assign_chunk_metadata(chunks)
         print(f"🔪 Split {len(documents)} documents into {len(chunks)} chunks.")
         return chunks
+
+    def _assign_chunk_metadata(
+        self, chunks: List[Document], file_path: Optional[str] = None
+    ) -> None:
+        """Assign stable chunk identifiers so source retrieval can be precise."""
+        if not chunks:
+            return
+
+        for idx, chunk in enumerate(chunks):
+            metadata = chunk.metadata or {}
+            source_file = (
+                metadata.get("source_file")
+                or metadata.get("source")
+                or (os.path.basename(file_path) if file_path else "unknown")
+            )
+            page = metadata.get("page", 0)
+            content_hash = hashlib.md5(
+                (chunk.page_content or "").encode("utf-8")
+            ).hexdigest()[:12]
+            chunk_id = f"{source_file}#p{page}:c{idx}:{content_hash}"
+
+            metadata["chunk_id"] = chunk_id
+            metadata["id"] = chunk_id
+            chunk.metadata = metadata
 
     def get_folder_statistics(self, folder_path: str) -> dict:
         """Get statistics about files in a folder."""

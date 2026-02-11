@@ -214,22 +214,21 @@ def main():
                     print()
                     continue
 
-                # Agentic Chat (Clean Mode)
-                result = controller.chat_agent(q)
+                # Hybrid chat (vector + graph retrieval + synthesis)
+                result = controller.chat_hybrid(q)
 
                 if "error" in result:
                     print(f"\n❌ {result['error']}\n")
                 else:
                     print(f"\n🤖 Answer: {result['answer']}")
 
-                    # Show sources if available
-                    if result.get("sources"):
-                        print("\n📚 Sources:")
-                        for source in result["sources"][:3]:
-                            content = source.get("content", "").strip()
-                            if len(content) > 100:
-                                content = content[:100] + "..."
-                            print(f"   - [{source.get('type', 'unknown')}] {content}")
+                    # Show retrieval hints if available
+                    if result.get("entities_found"):
+                        print("\n📚 Top entities:")
+                        for ent in result["entities_found"][:3]:
+                            name = ent.get("name", ent.get("id", "unknown")).strip()
+                            score = ent.get("score", 0)
+                            print(f"   - {name} (score: {score:.2f})")
                     print()
 
         elif choice == "8":
