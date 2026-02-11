@@ -246,8 +246,10 @@ class AgentService:
             return None
 
         entity = self.traversal_service.resolve_entity(name_or_id)
-        if entity:
-            return entity["id"]
+        if isinstance(entity, dict):
+            entity_id = entity.get("id")
+            if isinstance(entity_id, str) and entity_id.strip():
+                return entity_id
 
         return None
 

@@ -20,24 +20,38 @@ def agent_service(mock_neo4j_repo, mock_traversal_service):
     return AgentService(mock_neo4j_repo, mock_traversal_service)
 
 
-def test_resolve_to_id_with_search_results(agent_service, mock_neo4j_repo):
+def test_resolve_to_id_with_search_results(agent_service, mock_traversal_service):
     # Setup
-    mock_neo4j_repo.vector_search.return_value = [{"id": "model-123", "name": "GPT-4"}]
+    mock_traversal_service.resolve_entity.return_value = {
+        "id": "model-123",
+        "name": "GPT-4",
+    }
 
     # Execute
     result = agent_service._resolve_to_id("GPT-4")
 
     # Verify
     assert result == "model-123"
-    mock_neo4j_repo.vector_search.assert_called_once_with("GPT-4", top_k=1)
+    mock_traversal_service.resolve_entity.assert_called_once_with("GPT-4")
 
 
-def test_resolve_to_id_no_results(agent_service, mock_neo4j_repo):
+def test_resolve_to_id_no_results(agent_service, mock_traversal_service):
     # Setup
-    mock_neo4j_repo.vector_search.return_value = []
+    mock_traversal_service.resolve_entity.return_value = None
 
     # Execute
     result = agent_service._resolve_to_id("NonExistent")
+
+    # Verify
+    assert result is None
+
+
+def test_resolve_to_id_invalid_resolver_result(agent_service, mock_traversal_service):
+    # Setup
+    mock_traversal_service.resolve_entity.return_value = "not-a-dict"
+
+    # Execute
+    result = agent_service._resolve_to_id("GPT-4")
 
     # Verify
     assert result is None
