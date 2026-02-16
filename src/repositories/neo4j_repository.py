@@ -8,7 +8,8 @@ import json
 from typing import List, Dict, Any, Optional, Set
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from langchain_neo4j import Neo4jGraph, GraphCypherQAChain
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_openai import AzureChatOpenAI as ChatOpenAI
+from langchain_openai import AzureOpenAIEmbeddings as OpenAIEmbeddings
 from langchain_core.prompts import PromptTemplate
 
 from src.services.interfaces import INeo4jRepository
@@ -97,7 +98,12 @@ class Neo4jRepository(INeo4jRepository):
         """Lazy initialization of embeddings model."""
         if self._embeddings is None:
             self._embeddings = OpenAIEmbeddings(
-                model=config.EMBEDDING_MODEL, openai_api_key=config.OPENAI_API_KEY
+                model=config.EMBEDDING_MODEL,
+                azure_deployment=config.EMBEDDING_DEPLOYMENT,
+                dimensions=config.EMBEDDING_DIMENSION,
+                api_key=config.AZURE_OPENAI_API_KEY,
+                azure_endpoint=config.AZURE_OPENAI_ENDPOINT,
+                api_version=config.AZURE_OPENAI_API_VERSION,
             )
         return self._embeddings
 
@@ -105,7 +111,12 @@ class Neo4jRepository(INeo4jRepository):
         """Lazy initialization for role-specific LLM agents."""
         if agent_name not in self._agent_llms:
             self._agent_llms[agent_name] = ChatOpenAI(
-                temperature=0, model_name=config.LLM_MODEL
+                temperature=0,
+                model=config.LLM_MODEL,
+                azure_deployment=config.LLM_DEPLOYMENT,
+                api_key=config.AZURE_OPENAI_API_KEY,
+                azure_endpoint=config.AZURE_OPENAI_ENDPOINT,
+                api_version=config.AZURE_OPENAI_API_VERSION,
             )
         return self._agent_llms[agent_name]
 
@@ -1796,7 +1807,14 @@ Answer:"""
         graph = self._get_graph()
         graph.refresh_schema()
 
-        llm = ChatOpenAI(temperature=0, model_name=config.LLM_MODEL)
+        llm = ChatOpenAI(
+            temperature=0,
+            model=config.LLM_MODEL,
+            azure_deployment=config.LLM_DEPLOYMENT,
+            api_key=config.AZURE_OPENAI_API_KEY,
+            azure_endpoint=config.AZURE_OPENAI_ENDPOINT,
+            api_version=config.AZURE_OPENAI_API_VERSION,
+        )
 
         chain = GraphCypherQAChain.from_llm(
             graph=graph,

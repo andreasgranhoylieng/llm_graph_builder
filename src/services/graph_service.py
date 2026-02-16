@@ -6,7 +6,7 @@ Enhanced with description extraction for better embeddings.
 import math
 from typing import List, Optional, Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from langchain_openai import ChatOpenAI
+from langchain_openai import AzureChatOpenAI as ChatOpenAI
 from langchain_experimental.graph_transformers import LLMGraphTransformer
 from langchain_core.documents import Document
 from tenacity import (
@@ -36,7 +36,11 @@ class GraphService:
         if self._llm is None:
             self._llm = ChatOpenAI(
                 temperature=config.LLM_TEMPERATURE,
-                model_name=config.LLM_MODEL,
+                model=config.LLM_MODEL,
+                azure_deployment=config.LLM_DEPLOYMENT,
+                api_key=config.AZURE_OPENAI_API_KEY,
+                azure_endpoint=config.AZURE_OPENAI_ENDPOINT,
+                api_version=config.AZURE_OPENAI_API_VERSION,
                 request_timeout=120,
             )
         return self._llm

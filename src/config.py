@@ -13,7 +13,15 @@ def _env_bool(name: str, default: bool) -> bool:
 # =============================================================================
 # API KEYS AND DATABASE CONFIGURATION
 # =============================================================================
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
+AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT") or os.getenv(
+    "AZURE_OPENAI_END_POINT"
+)
+AZURE_OPENAI_API_VERSION = (
+    os.getenv("AZURE_OPENAI_API_VERSION")
+    or os.getenv("OPEN_API_VERSION_35")
+    or "2024-10-21"
+)
 NEO4J_URI = os.getenv("NEO4J_URI")
 NEO4J_USERNAME = os.getenv("NEO4J_USERNAME")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
@@ -22,14 +30,32 @@ NEO4J_DATABASE = os.getenv("NEO4J_DATABASE", "neo4j")
 # =============================================================================
 # LLM CONFIGURATION
 # =============================================================================
-LLM_MODEL = "gpt-4o-mini-2024-07-18"
+LLM_MODEL = os.getenv("LLM_MODEL") or os.getenv("MODEL_NAME") or "gpt-4o-mini"
+LLM_DEPLOYMENT = (
+    os.getenv("AZURE_OPENAI_LLM_DEPLOYMENT")
+    or os.getenv("DEPLOYMENT_NAME")
+    or LLM_MODEL
+)
 LLM_TEMPERATURE = 0.0
 
 # =============================================================================
 # EMBEDDING CONFIGURATION
 # =============================================================================
-EMBEDDING_MODEL = "text-embedding-3-large"
-EMBEDDING_DIMENSION = 3072  # For text-embedding-3-large
+EMBEDDING_MODEL = (
+    os.getenv("EMBEDDING_MODEL")
+    or os.getenv("EMBEDDING_MODEL_NAME")
+    or "text-embedding-3-large"
+)
+EMBEDDING_DEPLOYMENT = os.getenv(
+    "AZURE_OPENAI_EMBEDDING_DEPLOYMENT",
+    os.getenv("EMBEDDING_DEPLOYMENT_NAME", EMBEDDING_MODEL),
+)
+_embedding_dimension_default = 3072
+if EMBEDDING_MODEL in {"text-embedding-3-small", "text-embedding-ada-002"}:
+    _embedding_dimension_default = 1536
+EMBEDDING_DIMENSION = int(
+    os.getenv("EMBEDDING_DIMENSION", str(_embedding_dimension_default))
+)
 
 # =============================================================================
 # GENERATIVE AI KNOWLEDGE GRAPH SCHEMA

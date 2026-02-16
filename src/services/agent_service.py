@@ -4,7 +4,7 @@ Uses LangChain to reason about questions and select appropriate tools.
 """
 
 from typing import Dict, Any, Optional
-from langchain_openai import ChatOpenAI
+from langchain_openai import AzureChatOpenAI as ChatOpenAI
 from langchain.agents import create_agent
 from langchain_core.tools import tool
 from langchain_core.messages import HumanMessage, ToolMessage
@@ -32,7 +32,12 @@ class AgentService:
             return
 
         llm = ChatOpenAI(
-            model=config.LLM_MODEL, temperature=0, api_key=config.OPENAI_API_KEY
+            model=config.LLM_MODEL,
+            temperature=0,
+            azure_deployment=config.LLM_DEPLOYMENT,
+            api_key=config.AZURE_OPENAI_API_KEY,
+            azure_endpoint=config.AZURE_OPENAI_ENDPOINT,
+            api_version=config.AZURE_OPENAI_API_VERSION,
         )
 
         # Define Tools

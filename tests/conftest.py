@@ -189,7 +189,13 @@ def pytest_configure(config):
 @pytest.fixture(autouse=True)
 def set_test_environment():
     """Set environment variables for testing."""
-    os.environ.setdefault("OPENAI_API_KEY", "test-key")
+    os.environ.setdefault("AZURE_OPENAI_API_KEY", "test-key")
+    os.environ.setdefault("AZURE_OPENAI_ENDPOINT", "https://test-resource.openai.azure.com/")
+    os.environ.setdefault("AZURE_OPENAI_API_VERSION", "2024-10-21")
+    os.environ.setdefault("AZURE_OPENAI_LLM_DEPLOYMENT", "gpt-4o-mini")
+    os.environ.setdefault(
+        "AZURE_OPENAI_EMBEDDING_DEPLOYMENT", "text-embedding-3-large"
+    )
     os.environ.setdefault("NEO4J_URI", "bolt://localhost:7687")
     os.environ.setdefault("NEO4J_USERNAME", "neo4j")
     os.environ.setdefault("NEO4J_PASSWORD", "test-password")
