@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 from langchain_core.documents import Document
 
 from src.services.graph_service import GraphService
+from src import config
 
 
 class TestGraphExtraction:
@@ -225,5 +226,10 @@ class TestTransformerConfiguration:
 
             # Check that transformer was created with correct parameters
             call_kwargs = mock_transformer.call_args[1]
-            assert call_kwargs["node_properties"] is True
-            assert call_kwargs["relationship_properties"] is True
+            assert (
+                call_kwargs["node_properties"] == config.GRAPH_EXTRACT_NODE_PROPERTIES
+            )
+            assert (
+                call_kwargs["relationship_properties"]
+                == config.GRAPH_EXTRACT_RELATIONSHIP_PROPERTIES
+            )

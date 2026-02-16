@@ -5,6 +5,7 @@ Enhanced with SOTA GraphRAG: bidirectional BFS, parallel multi-source BFS, graph
 
 import hashlib
 import json
+import re
 from typing import List, Dict, Any, Optional, Set
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from langchain_neo4j import Neo4jGraph, GraphCypherQAChain
@@ -68,6 +69,54 @@ class Neo4jRepository(INeo4jRepository):
         self._graph: Optional[Neo4jGraph] = None
         self._embeddings: Optional[OpenAIEmbeddings] = None
         self._agent_llms: Dict[str, ChatOpenAI] = {}
+        self._subquery_cache: Dict[str, List[str]] = {}
+        self._retrieval_plan_cache: Dict[str, Dict[str, Any]] = {}
+        self._evidence_cache: Dict[str, Dict[str, Any]] = {}
+        self._disallowed_cypher_pattern = re.compile(
+            r"\b(CREATE|MERGE|DELETE|DETACH|SET|DROP|REMOVE|CALL\s+dbms|CALL\s+apoc\.periodic|LOAD\s+CSV|FOREACH)\b",
+            flags=re.IGNORECASE,
+        )
+        self._canonical_label_map = self._build_canonical_label_map()
+
+    def _build_canonical_label_map(self) -> Dict[str, str]:
+        """
+        Build mapping for common label drift variants (e.g. Aimodel -> AIModel).
+        """
+        mapping: Dict[str, str] = {}
+        for canonical in config.ALLOWED_NODES:
+            for variant in {
+                canonical,
+                canonical.capitalize(),
+                canonical.lower().capitalize(),
+                canonical.lower(),
+            }:
+                mapping[variant.lower()] = canonical
+        mapping["aicompany"] = "AICompany"
+        mapping["aimodel"] = "AIModel"
+        mapping["usecase"] = "UseCase"
+        return mapping
+
+    def _canonicalize_label(self, label: str) -> str:
+        key = str(label or "").strip().lower()
+        return self._canonical_label_map.get(key, str(label or "").strip())
+
+    def _normalize_cache_key(self, value: str) -> str:
+        return " ".join(str(value or "").lower().split())
+
+    def _cache_get(self, cache: Dict[str, Any], key: str) -> Optional[Any]:
+        if not config.ENABLE_QUERY_PLAN_CACHE:
+            return None
+        normalized = self._normalize_cache_key(key)
+        return cache.get(normalized)
+
+    def _cache_set(self, cache: Dict[str, Any], key: str, value: Any) -> None:
+        if not config.ENABLE_QUERY_PLAN_CACHE:
+            return
+        normalized = self._normalize_cache_key(key)
+        cache[normalized] = value
+        if len(cache) > max(1, config.QUERY_PLAN_CACHE_SIZE):
+            oldest_key = next(iter(cache))
+            cache.pop(oldest_key, None)
 
     # =========================================================================
     # CONNECTION MANAGEMENT
@@ -170,6 +219,8 @@ class Neo4jRepository(INeo4jRepository):
 
         embedded_node_ids: Set[str] = set()
         embedded_doc_ids: Set[str] = set()
+        touched_entity_ids: Set[str] = set()
+        touched_doc_ids: Set[str] = set()
 
         for i in range(0, len(graph_documents), batch_size):
             batch = graph_documents[i : i + batch_size]
@@ -185,6 +236,8 @@ class Neo4jRepository(INeo4jRepository):
                 docs_to_embed = self._collect_documents_for_embedding(
                     batch, embedded_doc_ids
                 )
+                touched_entity_ids.update(nodes_to_embed.keys())
+                touched_doc_ids.update(docs_to_embed.keys())
 
                 if config.SKIP_EXISTING_EMBEDDINGS and nodes_to_embed:
                     missing_node_ids = self._filter_ids_without_embedding(
@@ -267,6 +320,13 @@ class Neo4jRepository(INeo4jRepository):
             except Exception as e:
                 print(f"Batch {batches_processed + 1} failed: {e}")
                 continue
+
+        self._normalize_entity_labels(graph)
+        self._backfill_relationship_metadata(
+            graph,
+            entity_ids=list(touched_entity_ids),
+            document_ids=list(touched_doc_ids),
+        )
 
         return {
             "batches_processed": batches_processed,
@@ -399,6 +459,91 @@ class Neo4jRepository(INeo4jRepository):
 
         return result_ids
 
+    def _normalize_entity_labels(self, graph: Neo4jGraph) -> None:
+        """Normalize drifted labels to canonical schema labels."""
+        for canonical in config.ALLOWED_NODES:
+            drifted = canonical.capitalize()
+            if drifted == canonical:
+                continue
+            try:
+                graph.query(
+                    f"""
+                    MATCH (n:__Entity__:{drifted})
+                    SET n:{canonical}
+                    REMOVE n:{drifted}
+                    """
+                )
+            except Exception as e:
+                print(
+                    f"Label normalization warning for {drifted} -> {canonical}: {e}"
+                )
+
+    def _backfill_relationship_metadata(
+        self, graph: Neo4jGraph, entity_ids: List[str], document_ids: List[str]
+    ) -> None:
+        """
+        Ensure relationship provenance/confidence are populated for both extracted edges
+        and auto-created mention edges.
+        """
+        entity_ids = [str(item) for item in entity_ids if item]
+        document_ids = [str(item) for item in document_ids if item]
+
+        try:
+            graph.query(
+                """
+                MATCH (d:Document)-[r]-(e:__Entity__)
+                WHERE (size($document_ids) = 0 OR d.id IN $document_ids)
+                  AND (size($entity_ids) = 0 OR e.id IN $entity_ids)
+                SET r.source_file = coalesce(
+                        r.source_file,
+                        d.source_file,
+                        d.source,
+                        d.id
+                    ),
+                    r.source_chunk = coalesce(r.source_chunk, d.id),
+                    r.source_chunk_text = coalesce(
+                        r.source_chunk_text,
+                        substring(
+                            coalesce(d.text, d.page_content, d.content, ""),
+                            0,
+                            500
+                        )
+                    ),
+                    r.extracted_at = coalesce(r.extracted_at, datetime()),
+                    r.confidence = coalesce(
+                        r.confidence,
+                        CASE WHEN type(r) = 'MENTIONS' THEN 0.58 ELSE 0.7 END
+                    )
+                """,
+                params={"entity_ids": entity_ids, "document_ids": document_ids},
+            )
+        except Exception as e:
+            print(f"Relationship metadata backfill warning (document edges): {e}")
+
+        try:
+            graph.query(
+                """
+                MATCH (a:__Entity__)-[r]-(b:__Entity__)
+                WHERE (size($entity_ids) = 0 OR a.id IN $entity_ids OR b.id IN $entity_ids)
+                SET r.source_file = coalesce(
+                        r.source_file,
+                        a.source_document,
+                        b.source_document,
+                        'unknown'
+                    ),
+                    r.source_chunk = coalesce(
+                        r.source_chunk,
+                        a.source_chunk,
+                        b.source_chunk
+                    ),
+                    r.extracted_at = coalesce(r.extracted_at, datetime()),
+                    r.confidence = coalesce(r.confidence, 0.68)
+                """,
+                params={"entity_ids": entity_ids},
+            )
+        except Exception as e:
+            print(f"Relationship metadata backfill warning (entity edges): {e}")
+
     # =========================================================================
     # VECTOR SEARCH
     # =========================================================================
@@ -415,12 +560,19 @@ class Neo4jRepository(INeo4jRepository):
         """
         graph = self._get_graph()
         query_embedding = self._get_embeddings().embed_query(query)
+        node_labels_normalized = [
+            self._canonicalize_label(label).lower() for label in (node_labels or [])
+        ]
 
         cypher = """
         CALL db.index.vector.queryNodes('entity_embeddings', $top_k, $embedding)
         YIELD node, score
+        WITH node, score, [label IN labels(node) | toLower(label)] as node_labels_lower
         WHERE score >= $threshold
-          AND ($node_labels IS NULL OR size($node_labels) = 0 OR ANY(label IN labels(node) WHERE label IN $node_labels))
+          AND (
+              $node_labels IS NULL OR size($node_labels) = 0
+              OR ANY(label IN node_labels_lower WHERE label IN $node_labels)
+          )
         RETURN 
             node.id as id,
             COALESCE(node.name, node.id) as name,
@@ -437,7 +589,7 @@ class Neo4jRepository(INeo4jRepository):
                     "embedding": query_embedding,
                     "top_k": top_k,
                     "threshold": score_threshold,
-                    "node_labels": node_labels or [],
+                    "node_labels": node_labels_normalized,
                 },
             )
             return results or []
@@ -446,15 +598,24 @@ class Neo4jRepository(INeo4jRepository):
             return []
 
     def vector_search_documents(
-        self, query: str, top_k: int = 5
+        self,
+        query: str,
+        top_k: int = 5,
+        score_threshold: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
         """Search document chunks by vector similarity."""
         graph = self._get_graph()
         query_embedding = self._get_embeddings().embed_query(query)
+        threshold = (
+            config.DOCUMENT_SEARCH_SCORE_THRESHOLD
+            if score_threshold is None
+            else score_threshold
+        )
 
         cypher = """
         CALL db.index.vector.queryNodes('document_embeddings', $top_k, $embedding)
         YIELD node, score
+        WHERE score >= $threshold
         WITH node, score, [k IN ['text', 'page_content', 'content'] WHERE k IN keys(node)] as content_keys
         RETURN 
             node.id as id,
@@ -471,7 +632,12 @@ class Neo4jRepository(INeo4jRepository):
 
         try:
             results = graph.query(
-                cypher, params={"embedding": query_embedding, "top_k": top_k}
+                cypher,
+                params={
+                    "embedding": query_embedding,
+                    "top_k": top_k,
+                    "threshold": threshold,
+                },
             )
             return results or []
         except Exception as e:
@@ -533,6 +699,28 @@ class Neo4jRepository(INeo4jRepository):
 
         return None
 
+    def search_nodes_by_name(self, query_text: str, limit: int = 5) -> List[Dict[str, Any]]:
+        """Find nodes by full-text index for precise entity resolution."""
+        graph = self._get_graph()
+        cypher = """
+        CALL db.index.fulltext.queryNodes('entity_names', $query_text, {limit: $limit})
+        YIELD node, score
+        RETURN
+            node.id as id,
+            COALESCE(node.name, node.id) as name,
+            node.description as description,
+            labels(node) as labels,
+            score
+        ORDER BY score DESC
+        """
+        try:
+            results = graph.query(
+                cypher, params={"query_text": query_text, "limit": max(1, int(limit))}
+            )
+            return results or []
+        except Exception:
+            return []
+
     def get_neighbors(
         self,
         node_id: str,
@@ -573,7 +761,16 @@ class Neo4jRepository(INeo4jRepository):
 
         try:
             results = graph.query(cypher, params={"node_id": node_id})
-            return results or []
+            if not results:
+                return []
+            excluded_rel_types = {
+                rel_type.upper() for rel_type in config.GRAPH_RELATIONSHIP_EXCLUDE_TYPES
+            }
+            return [
+                row
+                for row in results
+                if str(row.get("relationship", "")).upper() not in excluded_rel_types
+            ]
         except Exception as e:
             print(f"⚠️ Neighbor search failed: {e}")
             return []
@@ -583,11 +780,15 @@ class Neo4jRepository(INeo4jRepository):
     ) -> Optional[List[Dict[str, Any]]]:
         """Find shortest path between two nodes."""
         graph = self._get_graph()
+        excluded_rel_types = [
+            rel_type.upper() for rel_type in config.GRAPH_RELATIONSHIP_EXCLUDE_TYPES
+        ]
 
         cypher = f"""
         MATCH path = shortestPath(
             (start {{id: $start_id}})-[*1..{max_depth}]-(end {{id: $end_id}})
         )
+        WHERE ALL(rel IN relationships(path) WHERE NOT type(rel) IN $excluded_rel_types)
         RETURN 
             [n IN nodes(path) | {{id: n.id, name: COALESCE(n.name, n.id), labels: labels(n)}}] as nodes,
             [r IN relationships(path) | {{type: type(r), properties: properties(r)}}] as relationships
@@ -595,7 +796,12 @@ class Neo4jRepository(INeo4jRepository):
 
         try:
             results = graph.query(
-                cypher, params={"start_id": start_id, "end_id": end_id}
+                cypher,
+                params={
+                    "start_id": start_id,
+                    "end_id": end_id,
+                    "excluded_rel_types": excluded_rel_types,
+                },
             )
             if results:
                 return {
@@ -619,6 +825,9 @@ class Neo4jRepository(INeo4jRepository):
         3. Final fallback to simple variable-length path match
         """
         graph = self._get_graph()
+        excluded_rel_types = [
+            rel_type.upper() for rel_type in config.GRAPH_RELATIONSHIP_EXCLUDE_TYPES
+        ]
 
         # --- Strategy 1: APOC BFS (true breadth-first, optimal) ---
         try:
@@ -630,6 +839,7 @@ class Neo4jRepository(INeo4jRepository):
                 bfs: true,
                 uniqueness: 'NODE_GLOBAL'
             }}) YIELD path
+            WHERE ALL(rel IN relationships(path) WHERE NOT type(rel) IN $excluded_rel_types)
             RETURN
                 [n IN nodes(path) | {{id: n.id, name: COALESCE(n.name, n.id), labels: labels(n)}}] as nodes,
                 [r IN relationships(path) | {{type: type(r), properties: properties(r)}}] as relationships
@@ -637,7 +847,12 @@ class Neo4jRepository(INeo4jRepository):
             LIMIT 1
             """
             results = graph.query(
-                apoc_cypher, params={"start_id": start_id, "end_id": end_id}
+                apoc_cypher,
+                params={
+                    "start_id": start_id,
+                    "end_id": end_id,
+                    "excluded_rel_types": excluded_rel_types,
+                },
             )
             if results:
                 return {
@@ -661,7 +876,9 @@ class Neo4jRepository(INeo4jRepository):
             WHERE meeting_point IS NOT NULL
             LIMIT 1
             MATCH path1 = shortestPath((start)-[*..{max_depth}]-(meeting_point))
+            WHERE ALL(rel IN relationships(path1) WHERE NOT type(rel) IN $excluded_rel_types)
             MATCH path2 = shortestPath((meeting_point)-[*..{max_depth}]-(end))
+            WHERE ALL(rel IN relationships(path2) WHERE NOT type(rel) IN $excluded_rel_types)
             WITH nodes(path1) + tail(nodes(path2)) as all_nodes,
                  relationships(path1) + relationships(path2) as all_rels
             RETURN
@@ -670,7 +887,12 @@ class Neo4jRepository(INeo4jRepository):
             LIMIT 1
             """
             results = graph.query(
-                bidir_cypher, params={"start_id": start_id, "end_id": end_id}
+                bidir_cypher,
+                params={
+                    "start_id": start_id,
+                    "end_id": end_id,
+                    "excluded_rel_types": excluded_rel_types,
+                },
             )
             if results and results[0].get("nodes"):
                 return {
@@ -683,6 +905,7 @@ class Neo4jRepository(INeo4jRepository):
         # --- Strategy 3: Simple variable-length path (original fallback) ---
         cypher = f"""
         MATCH path = (start {{id: $start_id}})-[*1..{max_depth}]-(end {{id: $end_id}})
+        WHERE ALL(rel IN relationships(path) WHERE NOT type(rel) IN $excluded_rel_types)
         RETURN
             [n IN nodes(path) | {{id: n.id, name: COALESCE(n.name, n.id), labels: labels(n)}}] as nodes,
             [r IN relationships(path) | {{type: type(r), properties: properties(r)}}] as relationships
@@ -692,7 +915,12 @@ class Neo4jRepository(INeo4jRepository):
 
         try:
             results = graph.query(
-                cypher, params={"start_id": start_id, "end_id": end_id}
+                cypher,
+                params={
+                    "start_id": start_id,
+                    "end_id": end_id,
+                    "excluded_rel_types": excluded_rel_types,
+                },
             )
             if results:
                 return {
@@ -733,6 +961,9 @@ class Neo4jRepository(INeo4jRepository):
 
         # Deduplicate seed IDs
         seed_ids = list(set(seed_ids))
+        excluded_rel_types = {
+            rel_type.upper() for rel_type in config.GRAPH_RELATIONSHIP_EXCLUDE_TYPES
+        }
 
         def _expand_single_seed(seed_id: str) -> Dict[str, Any]:
             """Expand from a single seed node."""
@@ -759,9 +990,14 @@ class Neo4jRepository(INeo4jRepository):
                 """
                 results = graph.query(apoc_cypher, params={"seed_id": seed_id})
                 if results:
+                    relationships = [
+                        rel
+                        for rel in results[0]["relationships"]
+                        if str(rel.get("type", "")).upper() not in excluded_rel_types
+                    ]
                     return {
                         "nodes": results[0]["nodes"],
-                        "relationships": results[0]["relationships"],
+                        "relationships": relationships,
                     }
             except Exception:
                 pass  # APOC not available
@@ -784,6 +1020,7 @@ class Neo4jRepository(INeo4jRepository):
             MATCH (center {{id: $seed_id}})
             OPTIONAL MATCH path = (center)-[r*1..{max_depth}]-()
             UNWIND r as rel
+            WITH rel WHERE NOT type(rel) IN $excluded_rel_types
             RETURN
                 collect(DISTINCT {{
                     type: type(rel),
@@ -796,7 +1033,11 @@ class Neo4jRepository(INeo4jRepository):
                     fallback_nodes_cypher, params={"seed_id": seed_id}
                 )
                 rel_results = graph.query(
-                    fallback_relationships_cypher, params={"seed_id": seed_id}
+                    fallback_relationships_cypher,
+                    params={
+                        "seed_id": seed_id,
+                        "excluded_rel_types": list(excluded_rel_types),
+                    },
                 )
                 return {
                     "nodes": node_results[0]["nodes"] if node_results else [],
@@ -838,16 +1079,31 @@ class Neo4jRepository(INeo4jRepository):
                     node_occurrence[nid] = node_occurrence.get(nid, 0) + 1
 
             for rel in subgraph.get("relationships", []):
+                if str(rel.get("type", "")).upper() in excluded_rel_types:
+                    continue
                 rel_key = f"{rel.get('start')}_{rel.get('type')}_{rel.get('end')}"
                 if rel_key not in seen_rels:
                     seen_rels.add(rel_key)
                     all_rels.append(rel)
 
+        # Keep only nodes participating in the retained relationship set (plus seeds)
+        participating_node_ids = set(seed_ids)
+        for rel in all_rels:
+            start = rel.get("start")
+            end = rel.get("end")
+            if start:
+                participating_node_ids.add(start)
+            if end:
+                participating_node_ids.add(end)
+        all_nodes = {
+            nid: node for nid, node in all_nodes.items() if nid in participating_node_ids
+        }
+
         # Bridge nodes: found from 2+ different seed expansions
         bridge_nodes = [
             all_nodes[nid]
             for nid, count in node_occurrence.items()
-            if count >= 2 and nid not in seed_ids
+            if count >= 2 and nid not in seed_ids and nid in all_nodes
         ]
 
         return {
@@ -884,14 +1140,18 @@ class Neo4jRepository(INeo4jRepository):
         distance_map = {eid: 0 for eid in entity_ids if eid in query_id_set}
         query_ids_for_db = [qid for qid in query_id_set]
         entity_ids_for_db = [eid for eid in entity_ids if eid not in query_id_set]
+        excluded_rel_types = [
+            rel_type.upper() for rel_type in config.GRAPH_RELATIONSHIP_EXCLUDE_TYPES
+        ]
 
         # Batch query: get shortest path lengths from each entity to any query entity
-        proximity_cypher = """
+        proximity_cypher = f"""
         UNWIND $entity_ids as eid
         UNWIND $query_ids as qid
         OPTIONAL MATCH path = shortestPath(
-            (e {id: eid})-[*..5]-(q {id: qid})
+            (e {{id: eid}})-[*..{config.GRAPH_PATH_MAX_DISTANCE}]-(q {{id: qid}})
         )
+        WHERE path IS NULL OR ALL(rel IN relationships(path) WHERE NOT type(rel) IN $excluded_rel_types)
         WITH eid, MIN(CASE WHEN path IS NOT NULL THEN length(path) ELSE null END) as min_distance
         RETURN eid, min_distance
         """
@@ -903,6 +1163,7 @@ class Neo4jRepository(INeo4jRepository):
                     params={
                         "entity_ids": entity_ids_for_db,
                         "query_ids": query_ids_for_db,
+                        "excluded_rel_types": excluded_rel_types,
                     },
                 )
 
@@ -919,7 +1180,7 @@ class Neo4jRepository(INeo4jRepository):
             return entities
 
         # Compute blended scores
-        max_distance = 6  # Normalize distances: anything >= 6 hops gets proximity 0
+        max_distance = max(config.GRAPH_PATH_MAX_DISTANCE + 1, 2)
         reranked = []
 
         for entity in entities:
@@ -950,6 +1211,9 @@ class Neo4jRepository(INeo4jRepository):
     def get_subgraph(self, center_id: str, max_depth: int = 2) -> Dict[str, Any]:
         """Get a subgraph centered on a node."""
         graph = self._get_graph()
+        excluded_rel_types = {
+            rel_type.upper() for rel_type in config.GRAPH_RELATIONSHIP_EXCLUDE_TYPES
+        }
 
         cypher = f"""
         MATCH (center {{id: $center_id}})
@@ -973,9 +1237,14 @@ class Neo4jRepository(INeo4jRepository):
         try:
             results = graph.query(cypher, params={"center_id": center_id})
             if results:
+                relationships = [
+                    rel
+                    for rel in results[0]["relationships"]
+                    if str(rel.get("type", "")).upper() not in excluded_rel_types
+                ]
                 return {
                     "nodes": results[0]["nodes"],
-                    "relationships": results[0]["relationships"],
+                    "relationships": relationships,
                 }
         except Exception:
             # APOC might not be installed, fallback to basic query
@@ -995,6 +1264,7 @@ class Neo4jRepository(INeo4jRepository):
             WITH center
             OPTIONAL MATCH path = (center)-[r*1..{max_depth}]-()
             UNWIND r as rel
+            WITH rel WHERE NOT type(rel) IN $excluded_rel_types
             RETURN collect(DISTINCT {{
                 type: type(rel),
                 start: startNode(rel).id,
@@ -1005,7 +1275,13 @@ class Neo4jRepository(INeo4jRepository):
         RETURN nodes, relationships
         """
 
-        results = graph.query(fallback_cypher, params={"center_id": center_id})
+        results = graph.query(
+            fallback_cypher,
+            params={
+                "center_id": center_id,
+                "excluded_rel_types": list(excluded_rel_types),
+            },
+        )
         if results:
             return {
                 "nodes": results[0].get("nodes", []),
@@ -1026,6 +1302,17 @@ class Neo4jRepository(INeo4jRepository):
         normalized = " ".join((question or "").split())
         if not normalized:
             return []
+
+        cached = self._cache_get(self._subquery_cache, normalized)
+        if isinstance(cached, list) and cached:
+            return list(cached)
+
+        if config.ENABLE_QUERY_PLANNER_FAST_PATH and self._is_single_intent_question(
+            normalized
+        ):
+            result = [normalized]
+            self._cache_set(self._subquery_cache, normalized, result)
+            return result
 
         planner_prompt = f"""You are a query planning assistant for a graph RAG system.
 
@@ -1088,10 +1375,14 @@ User question:
                 seen.add(key)
                 deduped.append(cleaned)
 
-            return deduped[:max_sub_questions] if deduped else [normalized]
+            result = deduped[:max_sub_questions] if deduped else [normalized]
+            self._cache_set(self._subquery_cache, normalized, result)
+            return result
         except Exception:
             # Safety fallback when planner output is malformed/unavailable.
-            return [normalized]
+            result = [normalized]
+            self._cache_set(self._subquery_cache, normalized, result)
+            return result
 
     def _plan_document_retrieval(self, question: str) -> Dict[str, Any]:
         """
@@ -1101,6 +1392,19 @@ User question:
         normalized = " ".join((question or "").split()).strip()
         if not normalized:
             return {"semantic_queries": [], "lexical_keywords": [], "numeric_focus": False}
+
+        cached_plan = self._cache_get(self._retrieval_plan_cache, normalized)
+        if isinstance(cached_plan, dict):
+            return dict(cached_plan)
+
+        if (
+            config.ENABLE_QUERY_PLANNER_FAST_PATH
+            and self._is_single_intent_question(normalized)
+            and not self._needs_numeric_focus(normalized)
+        ):
+            heuristic_plan = self._heuristic_retrieval_plan(normalized)
+            self._cache_set(self._retrieval_plan_cache, normalized, heuristic_plan)
+            return heuristic_plan
 
         planner_prompt = f"""You are a retrieval planner for a graph RAG system.
 
@@ -1203,15 +1507,71 @@ User question:
                 min_lexical_hits = 2
             min_lexical_hits = min(4, max(1, min_lexical_hits))
 
-            return {
+            result = {
                 "semantic_queries": semantic_queries,
                 "lexical_keywords": lexical_keywords,
                 "min_lexical_hits": min_lexical_hits,
                 "numeric_focus": numeric_focus,
                 "rerank_terms": rerank_terms,
             }
+            self._cache_set(self._retrieval_plan_cache, normalized, result)
+            return result
         except Exception:
+            self._cache_set(self._retrieval_plan_cache, normalized, fallback_plan)
             return fallback_plan
+
+    def _is_single_intent_question(self, question: str) -> bool:
+        text = str(question or "").lower()
+        split_signals = [
+            " and ",
+            ";",
+            " vs ",
+            " versus ",
+            "compare",
+            "also",
+            " then ",
+            ", and ",
+        ]
+        return not any(signal in text for signal in split_signals)
+
+    def _needs_numeric_focus(self, question: str) -> bool:
+        text = str(question or "").lower()
+        numeric_signals = [
+            "how much",
+            "how many",
+            "percent",
+            "percentage",
+            "date",
+            "when",
+            "rank",
+            "top ",
+            "count",
+            "valuation",
+            "funding",
+            "$",
+        ]
+        return any(signal in text for signal in numeric_signals)
+
+    def _heuristic_retrieval_plan(self, question: str) -> Dict[str, Any]:
+        normalized = " ".join((question or "").split()).strip()
+        keywords = []
+        seen = set()
+        for token in re.findall(r"[A-Za-z0-9][A-Za-z0-9\\-]{2,}", normalized):
+            lowered = token.lower()
+            if lowered in seen:
+                continue
+            seen.add(lowered)
+            keywords.append(token)
+            if len(keywords) >= 10:
+                break
+
+        return {
+            "semantic_queries": [normalized],
+            "lexical_keywords": keywords[:8],
+            "min_lexical_hits": 2,
+            "numeric_focus": self._needs_numeric_focus(normalized),
+            "rerank_terms": keywords[:6],
+        }
 
     def _curate_document_evidence(
         self,
@@ -1225,6 +1585,31 @@ User question:
         """
         if not chunks:
             return {"chunks": [], "evidence_snippets": []}
+
+        normalized_question = " ".join((question or "").split()).strip()
+        cache_key = f"{normalized_question}|{max_chunks}|{','.join(str(c.get('id','')) for c in chunks[:15])}"
+        cached_curated = self._cache_get(self._evidence_cache, cache_key)
+        if isinstance(cached_curated, dict):
+            return {
+                "chunks": [dict(item) for item in cached_curated.get("chunks", [])],
+                "evidence_snippets": list(
+                    cached_curated.get("evidence_snippets", [])
+                ),
+            }
+
+        if (
+            config.ENABLE_QUERY_PLANNER_FAST_PATH
+            and self._is_single_intent_question(normalized_question)
+            and not self._needs_numeric_focus(normalized_question)
+        ):
+            fallback_chunks = sorted(
+                [dict(item) for item in chunks],
+                key=lambda item: float(item.get("score", 0) or 0),
+                reverse=True,
+            )[:max_chunks]
+            result = {"chunks": fallback_chunks, "evidence_snippets": []}
+            self._cache_set(self._evidence_cache, cache_key, result)
+            return result
 
         candidates = []
         for chunk in chunks[:30]:
@@ -1343,9 +1728,16 @@ Rules:
                     if len(evidence_snippets) >= max_chunks:
                         break
 
-            return {"chunks": curated_chunks[:max_chunks], "evidence_snippets": evidence_snippets}
+            result = {
+                "chunks": curated_chunks[:max_chunks],
+                "evidence_snippets": evidence_snippets,
+            }
+            self._cache_set(self._evidence_cache, cache_key, result)
+            return result
         except Exception:
-            return {"chunks": fallback_chunks, "evidence_snippets": []}
+            result = {"chunks": fallback_chunks, "evidence_snippets": []}
+            self._cache_set(self._evidence_cache, cache_key, result)
+            return result
 
     def _keyword_search_documents(
         self, keywords: List[str], top_k: int = 8, min_hits: int = 2
@@ -1425,6 +1817,143 @@ Rules:
 
         return merged
 
+    def _token_overlap(self, left: str, right: str) -> float:
+        stopwords = {
+            "the",
+            "a",
+            "an",
+            "is",
+            "are",
+            "was",
+            "were",
+            "of",
+            "to",
+            "in",
+            "on",
+            "for",
+            "and",
+            "or",
+            "what",
+            "which",
+            "who",
+            "when",
+            "where",
+            "how",
+            "why",
+            "with",
+            "by",
+            "from",
+            "at",
+            "as",
+        }
+        left_tokens = {
+            token
+            for token in re.findall(r"[a-z0-9]+", str(left or "").lower())
+            if token not in stopwords and len(token) > 2
+        }
+        right_tokens = {
+            token
+            for token in re.findall(r"[a-z0-9]+", str(right or "").lower())
+            if token not in stopwords and len(token) > 2
+        }
+        if not left_tokens or not right_tokens:
+            return 0.0
+        return len(left_tokens & right_tokens) / max(len(left_tokens), 1)
+
+    def _extract_query_keywords(self, question: str, limit: int = 10) -> List[str]:
+        tokens = re.findall(r"[a-z0-9][a-z0-9\\-]{2,}", str(question or "").lower())
+        stopwords = {
+            "the",
+            "and",
+            "for",
+            "with",
+            "from",
+            "that",
+            "this",
+            "what",
+            "which",
+            "who",
+            "when",
+            "where",
+            "how",
+        }
+        keywords: List[str] = []
+        seen = set()
+        for token in tokens:
+            if token in stopwords or token in seen:
+                continue
+            seen.add(token)
+            keywords.append(token)
+            if len(keywords) >= limit:
+                break
+        return keywords
+
+    def _filter_question_relevant_chunks(
+        self,
+        question: str,
+        chunks: List[Dict[str, Any]],
+        lexical_keywords: List[str],
+    ) -> List[Dict[str, Any]]:
+        if not chunks:
+            return []
+
+        question_keywords = self._extract_query_keywords(question, limit=12)
+        lexical_set = {
+            str(keyword).lower()
+            for keyword in (lexical_keywords or [])
+            if isinstance(keyword, str) and keyword.strip()
+        }
+        all_keywords = list(dict.fromkeys(question_keywords + list(lexical_set)))
+        required_hits = 2 if len(question_keywords) >= 2 else 1
+
+        filtered: List[Dict[str, Any]] = []
+        for chunk in chunks:
+            content = str(chunk.get("content", "") or "")
+            lowered_content = content.lower()
+            keyword_hits = sum(1 for kw in all_keywords if kw in lowered_content)
+            overlap = self._token_overlap(" ".join(question_keywords), content)
+            base_score = float(chunk.get("score", 0) or 0)
+            hybrid_score = max(base_score, overlap + min(keyword_hits * 0.05, 0.2))
+
+            if keyword_hits >= required_hits or overlap >= 0.3:
+                enriched = dict(chunk)
+                enriched["_hybrid_score"] = round(hybrid_score, 4)
+                filtered.append(enriched)
+
+        return filtered
+
+    def _select_query_anchor_ids(
+        self, question: str, entities: List[Dict[str, Any]]
+    ) -> List[str]:
+        """Choose high-confidence anchor entities for graph-distance reranking."""
+        ranked: List[Dict[str, Any]] = []
+        for entity in entities[:8]:
+            entity_id = entity.get("id")
+            if not entity_id:
+                continue
+            name = entity.get("name", entity_id)
+            overlap = self._token_overlap(question, name)
+            score = float(entity.get("score", 0) or 0)
+            ranked.append(
+                {
+                    "id": entity_id,
+                    "overlap": overlap,
+                    "score": score,
+                    "rank_score": (0.7 * overlap) + (0.3 * score),
+                }
+            )
+
+        ranked.sort(key=lambda item: item["rank_score"], reverse=True)
+        anchors = [
+            item["id"]
+            for item in ranked
+            if item["overlap"] >= config.ENTITY_RESOLVE_MIN_TOKEN_OVERLAP
+        ][:2]
+
+        if not anchors and ranked:
+            anchors = [ranked[0]["id"]]
+        return anchors
+
     def _retrieve_hybrid_context(self, question: str, top_k: int = 10) -> Dict[str, Any]:
         """Run retrieval/expansion/reranking for one question segment."""
         entities = self.vector_search(
@@ -1433,7 +1962,11 @@ Rules:
         retrieval_plan = self._plan_document_retrieval(question)
         doc_query_variants = retrieval_plan.get("semantic_queries", []) or [question]
         doc_chunk_groups = [
-            self.vector_search_documents(query_variant, top_k=7)
+            self.vector_search_documents(
+                query_variant,
+                top_k=config.DOCUMENT_SEARCH_TOP_K,
+                score_threshold=config.DOCUMENT_SEARCH_SCORE_THRESHOLD,
+            )
             for query_variant in doc_query_variants
         ]
         lexical_keywords = retrieval_plan.get("lexical_keywords", [])
@@ -1452,8 +1985,14 @@ Rules:
         )
         doc_chunks = curation.get("chunks", []) or []
         evidence_snippets = curation.get("evidence_snippets", []) or []
+        doc_chunks = self._filter_question_relevant_chunks(
+            question, doc_chunks, lexical_keywords
+        )
+        if not doc_chunks:
+            evidence_snippets = []
 
         seed_ids = [e["id"] for e in entities[:5] if e.get("id")]
+        anchor_ids = self._select_query_anchor_ids(question, entities)
         expanded_subgraph = {"nodes": [], "relationships": [], "bridge_nodes": []}
 
         if seed_ids:
@@ -1469,11 +2008,11 @@ Rules:
                     )
                     expanded_subgraph["nodes"].extend(neighbors)
 
-        if entities and seed_ids:
+        if entities and anchor_ids:
             try:
                 entities = self.graph_rerank(
                     entities,
-                    query_entity_ids=seed_ids[:3],
+                    query_entity_ids=anchor_ids,
                     vector_weight=config.RERANK_VECTOR_WEIGHT,
                     graph_weight=config.RERANK_GRAPH_WEIGHT,
                 )
@@ -1623,6 +2162,154 @@ Answer:"""
         response = llm.invoke(prompt)
         return response.content
 
+    def _retrieve_global_context(
+        self, question: str, entities: List[Dict[str, Any]], doc_chunks: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """
+        Retrieve broader (global/community-like) context beyond local multi-hop expansion.
+        """
+        if not config.ENABLE_GLOBAL_CONTEXT:
+            return {"communities": [], "global_facts": []}
+
+        graph = self._get_graph()
+        entity_ids = [str(item.get("id")) for item in entities[:10] if item.get("id")]
+        doc_ids = [str(item.get("id")) for item in doc_chunks[:12] if item.get("id")]
+
+        community_rows: List[Dict[str, Any]] = []
+        fact_rows: List[Dict[str, Any]] = []
+
+        try:
+            community_rows = graph.query(
+                """
+                MATCH (e:__Entity__)
+                WHERE (size($entity_ids) = 0 OR e.id IN $entity_ids)
+                UNWIND [lbl IN labels(e) WHERE lbl <> '__Entity__'] as community
+                RETURN
+                    community,
+                    count(*) as mentions,
+                    collect(DISTINCT COALESCE(e.name, e.id))[0..5] as exemplars
+                ORDER BY mentions DESC
+                LIMIT $limit
+                """,
+                params={
+                    "entity_ids": entity_ids,
+                    "limit": max(1, config.GLOBAL_CONTEXT_MAX_COMMUNITIES),
+                },
+            )
+        except Exception:
+            community_rows = []
+
+        try:
+            fact_rows = graph.query(
+                """
+                MATCH (d:Document)
+                WHERE size($doc_ids) = 0 OR d.id IN $doc_ids
+                MATCH (d)-[r]-(e:__Entity__)
+                WHERE NOT type(r) IN $excluded_rel_types
+                RETURN
+                    type(r) as relationship,
+                    count(*) as frequency,
+                    collect(DISTINCT COALESCE(e.name, e.id))[0..4] as examples
+                ORDER BY frequency DESC
+                LIMIT $limit
+                """,
+                params={
+                    "doc_ids": doc_ids,
+                    "excluded_rel_types": [
+                        rel_type.upper()
+                        for rel_type in config.GRAPH_RELATIONSHIP_EXCLUDE_TYPES
+                    ],
+                    "limit": max(1, config.GLOBAL_CONTEXT_MAX_FACTS),
+                },
+            )
+        except Exception:
+            fact_rows = []
+
+        return {"communities": community_rows or [], "global_facts": fact_rows or []}
+
+    def _calculate_confidence(
+        self,
+        entities: List[Dict[str, Any]],
+        doc_chunks: List[Dict[str, Any]],
+        evidence_snippets: List[str],
+        sub_question_coverage: float,
+        llm_failed: bool,
+    ) -> float:
+        """
+        Confidence calibration emphasizing grounding and coverage over raw retrieval score.
+        """
+        entity_scores = [
+            float(item.get("score", 0) or 0) for item in (entities or [])[:3]
+        ]
+        doc_scores = [float(item.get("score", 0) or 0) for item in (doc_chunks or [])[:3]]
+        entity_signal = sum(entity_scores) / len(entity_scores) if entity_scores else 0.0
+        doc_signal = sum(doc_scores) / len(doc_scores) if doc_scores else 0.0
+
+        evidence_target = max(config.HYBRID_MIN_EVIDENCE_SNIPPETS, 1)
+        evidence_signal = min(len(evidence_snippets) / evidence_target, 1.0)
+
+        grounded = 1.0 if doc_chunks else (0.45 if entities else 0.0)
+
+        confidence = (
+            0.35 * entity_signal
+            + 0.35 * doc_signal
+            + 0.2 * sub_question_coverage
+            + 0.1 * evidence_signal
+        ) * grounded
+
+        if not doc_chunks and entities:
+            confidence = min(confidence, 0.65)
+        if not doc_chunks and not entities:
+            confidence = config.CONFIDENCE_MIN_FOR_UNGROUNDED
+        if llm_failed:
+            confidence = min(confidence, 0.2)
+
+        return round(min(max(confidence, 0.0), 1.0), 3)
+
+    def _looks_ungrounded_answer(self, answer: str) -> bool:
+        text = str(answer or "").lower()
+        markers = [
+            "not derived from the provided source",
+            "not found in the provided source",
+            "not in the provided source",
+            "common knowledge",
+            "outside the provided",
+            "not grounded in the retrieved evidence",
+        ]
+        return any(marker in text for marker in markers)
+
+    def _build_ungrounded_response(
+        self, question: str, sub_questions: List[str]
+    ) -> Dict[str, Any]:
+        if config.ALLOW_CYPHER_FALLBACK_WITHOUT_RETRIEVAL:
+            return {
+                "answer": self.query(question),
+                "entities_found": [],
+                "graph_context": [],
+                "bridge_nodes": [],
+                "global_context": {"communities": [], "global_facts": []},
+                "doc_chunks_used": 0,
+                "sub_questions": sub_questions,
+                "sub_question_coverage": 0.0,
+                "confidence": round(config.CONFIDENCE_MAX_FOR_UNGROUNDED, 3),
+                "method": "cypher_fallback",
+                "status": "success",
+            }
+
+        return {
+            "answer": "I could not find grounded evidence for this question in the indexed graph/documents.",
+            "entities_found": [],
+            "graph_context": [],
+            "bridge_nodes": [],
+            "global_context": {"communities": [], "global_facts": []},
+            "doc_chunks_used": 0,
+            "sub_questions": sub_questions,
+            "sub_question_coverage": 0.0,
+            "confidence": round(config.CONFIDENCE_MIN_FOR_UNGROUNDED, 3),
+            "method": "grounded_abstain",
+            "status": "success",
+        }
+
     def query_hybrid(self, question: str, top_k: int = 10) -> Dict[str, Any]:
         """
         SOTA Hybrid query combining vector search, parallel BFS expansion,
@@ -1644,16 +2331,7 @@ Answer:"""
         ]
 
         if not contexts_with_hits:
-            return {
-                "answer": self.query(question),
-                "entities_found": [],
-                "graph_context": [],
-                "bridge_nodes": [],
-                "sub_questions": sub_questions,
-                "sub_question_coverage": 0.0,
-                "confidence": 0.3,
-                "method": "cypher_fallback",
-            }
+            return self._build_ungrounded_response(question, sub_questions)
 
         entities = self._merge_entities(
             [ctx.get("entities", []) for ctx in contexts_with_hits]
@@ -1673,6 +2351,7 @@ Answer:"""
             [ctx.get("expanded_subgraph", {}) for ctx in contexts_with_hits]
         )
         sub_question_coverage = len(contexts_with_hits) / max(len(sub_questions), 1)
+        global_context = self._retrieve_global_context(question, entities, doc_chunks)
 
         # === Stage 4: SYNTHESIZE ===
         context_parts = []
@@ -1764,6 +2443,26 @@ Answer:"""
                 rel_type = rel.get("type", "RELATED_TO")
                 context_parts.append(f"- {start} --[{rel_type}]--> {end}")
 
+        if global_context.get("communities"):
+            context_parts.append("\n## Global Community Signals:")
+            for item in global_context["communities"][: config.GLOBAL_CONTEXT_MAX_COMMUNITIES]:
+                community = item.get("community", "Unknown")
+                mentions = item.get("mentions", 0)
+                exemplars = ", ".join(item.get("exemplars", [])[:4])
+                context_parts.append(
+                    f"- {community}: {mentions} mentions (examples: {exemplars})"
+                )
+
+        if global_context.get("global_facts"):
+            context_parts.append("\n## Global Relationship Patterns:")
+            for item in global_context["global_facts"][: config.GLOBAL_CONTEXT_MAX_FACTS]:
+                relationship = item.get("relationship", "RELATED_TO")
+                frequency = item.get("frequency", 0)
+                examples = ", ".join(item.get("examples", [])[:4])
+                context_parts.append(
+                    f"- {relationship}: {frequency} occurrences (examples: {examples})"
+                )
+
         context_str = "\n".join(context_parts)
 
         llm_failed = False
@@ -1773,31 +2472,29 @@ Answer:"""
             llm_failed = True
             answer = f"Error generating answer: {e}"
 
-        # Confidence: blend vector relevance, document relevance, and multi-part coverage.
-        top_entity_score = entities[0].get("score", 0) if entities else 0
-        top_doc_score = doc_chunks[0].get("score", 0) if doc_chunks else 0
-        confidence = (
-            0.6 * top_entity_score + 0.3 * top_doc_score + 0.1 * sub_question_coverage
+        if not llm_failed and self._looks_ungrounded_answer(answer):
+            abstain = self._build_ungrounded_response(question, sub_questions)
+            abstain["method"] = "hybrid_abstain"
+            return abstain
+
+        confidence = self._calculate_confidence(
+            entities=entities,
+            doc_chunks=doc_chunks,
+            evidence_snippets=evidence_snippets,
+            sub_question_coverage=sub_question_coverage,
+            llm_failed=llm_failed,
         )
-
-        if not entities and doc_chunks:
-            confidence = min(max(top_doc_score, 0.4) * sub_question_coverage, 0.85)
-
-        if bridge_nodes:
-            confidence = min(confidence * 1.05, 1.0)
-
-        if llm_failed:
-            confidence = min(confidence, 0.2)
 
         return {
             "answer": answer,
             "entities_found": entities,
             "graph_context": expanded_nodes[:10],
             "bridge_nodes": bridge_nodes,
+            "global_context": global_context,
             "doc_chunks_used": len(doc_chunks),
             "sub_questions": sub_questions,
             "sub_question_coverage": round(sub_question_coverage, 3),
-            "confidence": round(confidence, 3),
+            "confidence": confidence,
             "method": "hybrid_sota",
             "status": "error" if llm_failed else "success",
         }
@@ -1820,7 +2517,7 @@ Answer:"""
             graph=graph,
             llm=llm,
             verbose=True,
-            allow_dangerous_requests=True,
+            allow_dangerous_requests=False,
             cypher_prompt=CYPHER_GENERATION_PROMPT,
         )
 
@@ -1867,6 +2564,8 @@ Answer:"""
                 if "already exists" not in str(e).lower():
                     print(f"⚠️ Index creation note: {e}")
 
+        self._normalize_entity_labels(graph)
+        self._backfill_relationship_metadata(graph, entity_ids=[], document_ids=[])
         print("✅ Database indexes created/verified")
 
     def get_statistics(self) -> dict:
@@ -1927,8 +2626,17 @@ Answer:"""
         print(f"🗑️ Cleared {deleted_total} nodes from database")
         return deleted_total
 
+    def _is_safe_read_only_cypher(self, query: str) -> bool:
+        if not query or not str(query).strip():
+            return False
+        return self._disallowed_cypher_pattern.search(str(query)) is None
+
     def execute_cypher(self, query: str, params: Optional[dict] = None) -> List[dict]:
         """Execute a raw Cypher query."""
+        if not self._is_safe_read_only_cypher(query):
+            raise ValueError(
+                "Only read-only Cypher is allowed via execute_cypher()."
+            )
         graph = self._get_graph()
         return graph.query(query, params=params or {})
 

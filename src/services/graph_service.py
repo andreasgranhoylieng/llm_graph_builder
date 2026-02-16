@@ -316,12 +316,22 @@ class GraphService:
             # Extract source info
             source_text = ""
             source_id = "unknown"
+            source_chunk_id = "unknown"
 
             if hasattr(g_doc, "source") and g_doc.source:
                 if hasattr(g_doc.source, "page_content"):
                     source_text = g_doc.source.page_content
                 if hasattr(g_doc.source, "metadata"):
-                    source_id = g_doc.source.metadata.get("source", "unknown")
+                    source_metadata = g_doc.source.metadata or {}
+                    source_id = (
+                        source_metadata.get("source_file")
+                        or source_metadata.get("source")
+                        or source_metadata.get("source_path")
+                        or "unknown"
+                    )
+                    source_chunk_id = source_metadata.get("chunk_id") or source_metadata.get(
+                        "id", "unknown"
+                    )
 
             # Enrich nodes with description if missing
             for node in g_doc.nodes:
@@ -330,6 +340,7 @@ class GraphService:
 
                 # Add source tracking
                 node.properties["source_document"] = source_id
+                node.properties["source_chunk"] = source_chunk_id
 
                 # Clean and set proper name
                 clean_name = self._clean_node_name(node.id)
@@ -342,9 +353,13 @@ class GraphService:
                     if description:
                         node.properties["description"] = description
 
-                # Add confidence score (could be enhanced with actual confidence)
                 if "confidence" not in node.properties:
-                    node.properties["confidence"] = 0.8
+                    node.properties["confidence"] = self._estimate_node_confidence(
+                        node_id=node.id,
+                        name=node.properties.get("name"),
+                        description=node.properties.get("description", ""),
+                        source_text=source_text,
+                    )
 
             # Enrich relationships
             for rel in g_doc.relationships:
@@ -355,7 +370,9 @@ class GraphService:
                     source_text[:500] if source_text else ""
                 )
                 rel.properties["source_file"] = source_id
+                rel.properties["source_chunk"] = source_chunk_id
                 rel.properties["extracted_at"] = self._get_timestamp()
+                rel.properties["confidence"] = rel.properties.get("confidence", 0.72)
 
     def _extract_entity_description(
         self, entity_name: str, source_text: str, max_length: int = 200
@@ -446,6 +463,36 @@ class GraphService:
         name = " ".join(name.split())
 
         return name if name else "Unknown"
+
+    def _estimate_node_confidence(
+        self, node_id: str, name: str, description: str, source_text: str
+    ) -> float:
+        """
+        Estimate node confidence from grounding signals.
+
+        This is intentionally lightweight:
+        - Presence of a usable name
+        - Presence/length of a grounded description
+        - Whether source text appears to mention the entity
+        """
+        score = 0.5
+        cleaned_id = str(node_id or "").strip().lower()
+        cleaned_name = str(name or "").strip().lower()
+        cleaned_description = str(description or "").strip()
+        cleaned_source = str(source_text or "").lower()
+
+        if cleaned_name and cleaned_name not in {"unknown", "n/a"}:
+            score += 0.15
+        if cleaned_description:
+            score += 0.15
+            if len(cleaned_description) >= 40:
+                score += 0.05
+        if cleaned_id and cleaned_source and cleaned_id in cleaned_source:
+            score += 0.1
+        elif cleaned_name and cleaned_source and cleaned_name in cleaned_source:
+            score += 0.1
+
+        return round(min(max(score, 0.05), 0.95), 3)
 
     def _get_timestamp(self) -> str:
         """Get current ISO timestamp."""

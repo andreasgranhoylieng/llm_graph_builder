@@ -97,7 +97,7 @@ class INeo4jRepository(ABC):
 
     @abstractmethod
     def vector_search_documents(
-        self, query: str, top_k: int = 5
+        self, query: str, top_k: int = 5, score_threshold: Optional[float] = None
     ) -> List[Dict[str, Any]]:
         """Search document chunks by vector similarity."""
         pass

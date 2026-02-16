@@ -99,7 +99,11 @@ class AgentService:
             Search the original source documents (chunks).
             Use this to get specific text details that might not be in the graph structure.
             """
-            results = self.neo4j_repo.vector_search_documents(query, top_k=3)
+            results = self.neo4j_repo.vector_search_documents(
+                query,
+                top_k=3,
+                score_threshold=config.DOCUMENT_SEARCH_SCORE_THRESHOLD,
+            )
             if not results:
                 return "No relevant document chunks found."
 

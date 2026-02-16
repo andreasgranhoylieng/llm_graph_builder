@@ -10,6 +10,13 @@ def _env_bool(name: str, default: bool) -> bool:
     value = os.getenv(name, str(default)).strip().lower()
     return value in {"1", "true", "yes", "y", "on"}
 
+
+def _env_csv(name: str, default: str = "") -> List[str]:
+    """Parse comma-separated env values into a cleaned list."""
+    raw_value = os.getenv(name, default) or ""
+    values = [item.strip() for item in raw_value.split(",")]
+    return [item for item in values if item]
+
 # =============================================================================
 # API KEYS AND DATABASE CONFIGURATION
 # =============================================================================
@@ -298,6 +305,10 @@ ENABLE_DETAILED_LOGGING = True
 # =============================================================================
 VECTOR_SEARCH_TOP_K = 30
 VECTOR_SEARCH_SCORE_THRESHOLD = 0.7
+DOCUMENT_SEARCH_SCORE_THRESHOLD = float(
+    os.getenv("DOCUMENT_SEARCH_SCORE_THRESHOLD", "0.72")
+)
+DOCUMENT_SEARCH_TOP_K = int(os.getenv("DOCUMENT_SEARCH_TOP_K", "7"))
 HYBRID_SEARCH_DEPTH = 10  # Hops for graph expansion after vector search
 
 # =============================================================================
@@ -308,3 +319,39 @@ BFS_MAX_DEPTH = 4  # Max hops for BFS traversals
 RERANK_VECTOR_WEIGHT = 0.6  # Weight for vector similarity in reranking
 RERANK_GRAPH_WEIGHT = 0.4  # Weight for graph proximity in reranking
 MULTI_HOP_CONTEXT_DEPTH = 3  # Depth for multi-hop context extraction
+GRAPH_RELATIONSHIP_EXCLUDE_TYPES = _env_csv(
+    "GRAPH_RELATIONSHIP_EXCLUDE_TYPES", "MENTIONS"
+)
+GRAPH_PATH_MAX_DISTANCE = int(os.getenv("GRAPH_PATH_MAX_DISTANCE", "5"))
+ENABLE_GLOBAL_CONTEXT = _env_bool("ENABLE_GLOBAL_CONTEXT", True)
+GLOBAL_CONTEXT_MAX_COMMUNITIES = int(os.getenv("GLOBAL_CONTEXT_MAX_COMMUNITIES", "5"))
+GLOBAL_CONTEXT_MAX_FACTS = int(os.getenv("GLOBAL_CONTEXT_MAX_FACTS", "8"))
+
+# Entity resolution quality controls
+ENTITY_RESOLVE_MIN_VECTOR_SCORE = float(
+    os.getenv("ENTITY_RESOLVE_MIN_VECTOR_SCORE", "0.78")
+)
+ENTITY_RESOLVE_MIN_SCORE_MARGIN = float(
+    os.getenv("ENTITY_RESOLVE_MIN_SCORE_MARGIN", "0.06")
+)
+ENTITY_RESOLVE_MIN_TOKEN_OVERLAP = float(
+    os.getenv("ENTITY_RESOLVE_MIN_TOKEN_OVERLAP", "0.5")
+)
+ENTITY_RESOLVE_FULLTEXT_LIMIT = int(os.getenv("ENTITY_RESOLVE_FULLTEXT_LIMIT", "5"))
+
+# Hybrid query behavior and confidence calibration
+ALLOW_CYPHER_FALLBACK_WITHOUT_RETRIEVAL = _env_bool(
+    "ALLOW_CYPHER_FALLBACK_WITHOUT_RETRIEVAL", False
+)
+CONFIDENCE_MIN_FOR_UNGROUNDED = float(
+    os.getenv("CONFIDENCE_MIN_FOR_UNGROUNDED", "0.05")
+)
+CONFIDENCE_MAX_FOR_UNGROUNDED = float(
+    os.getenv("CONFIDENCE_MAX_FOR_UNGROUNDED", "0.25")
+)
+HYBRID_MIN_EVIDENCE_SNIPPETS = int(os.getenv("HYBRID_MIN_EVIDENCE_SNIPPETS", "1"))
+
+# Query planner/curator latency optimizations
+ENABLE_QUERY_PLANNER_FAST_PATH = _env_bool("ENABLE_QUERY_PLANNER_FAST_PATH", True)
+ENABLE_QUERY_PLAN_CACHE = _env_bool("ENABLE_QUERY_PLAN_CACHE", True)
+QUERY_PLAN_CACHE_SIZE = int(os.getenv("QUERY_PLAN_CACHE_SIZE", "256"))

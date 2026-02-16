@@ -238,6 +238,7 @@ class TestCompareModels:
         mock_repo.vector_search.side_effect = [
             [{"id": "GPT-4", "name": "GPT-4", "score": 0.95}],
             [],  # Second model not found
+            [],  # Relaxed fallback search also not found
         ]
         mock_repo.get_neighbors.return_value = []
 

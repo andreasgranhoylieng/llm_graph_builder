@@ -5,6 +5,7 @@ Tests for Neo4jRepository - Vector search, graph traversal, and data operations.
 import pytest
 from unittest.mock import MagicMock, patch
 from src.repositories.neo4j_repository import Neo4jRepository
+from src import config
 
 
 class TestNeo4jRepositoryConnection:
@@ -74,9 +75,9 @@ class TestVectorSearch:
             query = call_args[0][0]
             params = call_args[1]["params"]
             assert "WHERE score >= $threshold" in query
-            assert "AND ($node_labels IS NULL" in query
-            assert "ANY(label IN labels(node)" in query
-            assert params["node_labels"] == ["AIModel", "AICompany"]
+            assert "$node_labels IS NULL" in query
+            assert "ANY(label IN node_labels_lower" in query
+            assert params["node_labels"] == ["aimodel", "aicompany"]
 
     def test_vector_search_handles_empty_results(
         self, mock_neo4j_graph, mock_embeddings
@@ -469,7 +470,7 @@ class TestHybridQuery:
             assert "Error generating answer" in result["answer"]
 
     def test_hybrid_query_falls_back_to_cypher(self, mock_neo4j_graph, mock_embeddings):
-        """Test hybrid query falls back to Cypher when no vector matches."""
+        """Test hybrid query abstains or falls back based on grounding configuration."""
         with (
             patch("src.repositories.neo4j_repository.Neo4jGraph") as neo4j_mock,
             patch("src.repositories.neo4j_repository.OpenAIEmbeddings") as emb_mock,
@@ -488,8 +489,11 @@ class TestHybridQuery:
 
             repo = Neo4jRepository()
             result = repo.query_hybrid("Unknown topic")
-
-            assert result["method"] == "cypher_fallback"
+            if config.ALLOW_CYPHER_FALLBACK_WITHOUT_RETRIEVAL:
+                assert result["method"] == "cypher_fallback"
+            else:
+                assert result["method"] == "grounded_abstain"
+                assert result["confidence"] <= config.CONFIDENCE_MAX_FOR_UNGROUNDED
 
 
 class TestEmbeddingGeneration:
@@ -618,6 +622,15 @@ class TestDatabaseManagement:
                 repo.clear_database(confirm=False)
 
             assert "confirm=True" in str(exc_info.value)
+
+    def test_execute_cypher_blocks_write_queries(self, mock_neo4j_graph):
+        """Raw Cypher execution endpoint must reject mutating statements."""
+        with patch("src.repositories.neo4j_repository.Neo4jGraph") as neo4j_mock:
+            neo4j_mock.return_value = mock_neo4j_graph
+            repo = Neo4jRepository()
+
+            with pytest.raises(ValueError):
+                repo.execute_cypher("MATCH (n) DELETE n")
 
 
 class TestBidirectionalBFS:

@@ -2,8 +2,10 @@
 TraversalService - Advanced graph traversal and context extraction for RAG.
 """
 
+import re
 from typing import List, Dict, Any, Optional
 from src.services.interfaces import INeo4jRepository, ITraversalService
+from src import config
 
 
 class TraversalService(ITraversalService):
@@ -221,6 +223,18 @@ class TraversalService(ITraversalService):
         )
 
         if not models:
+            # Relaxed fallback to handle legacy label drift (e.g. Aimodel)
+            models = self.neo4j_repo.vector_search(
+                model_name, top_k=3, score_threshold=0.75
+            )
+            models = [
+                item
+                for item in models
+                if self._has_label(item, "AIModel")
+                and self._token_overlap(model_name, item.get("name", "")) >= 0.4
+            ][:1]
+
+        if not models:
             return {"found": False, "message": f"Model '{model_name}' not found."}
 
         model = models[0]
@@ -246,23 +260,23 @@ class TraversalService(ITraversalService):
             labels = neighbor.get("labels", [])
             rel_type = neighbor.get("relationship", "")
 
-            if "AICompany" in labels or "Organization" in labels:
+            if self._contains_any_label(labels, {"AICompany", "Organization"}):
                 result["developed_by"].append(neighbor)
-            elif "Architecture" in labels:
+            elif self._has_label_from_list(labels, "Architecture"):
                 result["architecture"].append(neighbor)
-            elif "Technique" in labels:
+            elif self._has_label_from_list(labels, "Technique"):
                 result["techniques"].append(neighbor)
-            elif "Benchmark" in labels:
+            elif self._has_label_from_list(labels, "Benchmark"):
                 result["benchmarks"].append(neighbor)
-            elif "Dataset" in labels:
+            elif self._has_label_from_list(labels, "Dataset"):
                 result["datasets"].append(neighbor)
-            elif "AIModel" in labels and rel_type in [
+            elif self._has_label_from_list(labels, "AIModel") and rel_type in [
                 "FINE_TUNED_FROM",
                 "SUCCEEDED_BY",
                 "SIMILAR_TO",
             ]:
                 result["related_models"].append(neighbor)
-            elif "Application" in labels:
+            elif self._has_label_from_list(labels, "Application"):
                 result["applications"].append(neighbor)
 
         return result
@@ -352,6 +366,10 @@ class TraversalService(ITraversalService):
         if not name_or_id:
             return None
 
+        normalized_query = self._normalize_for_match(name_or_id)
+        if not normalized_query:
+            return None
+
         # 1. Check if it's already a valid ID
         node = self.neo4j_repo.get_node_by_id(name_or_id)
         if node:
@@ -363,30 +381,83 @@ class TraversalService(ITraversalService):
             if node:
                 return node
 
-        # 3. Fallback to vector search
-        # Increase top_k to check for close comparisons
+        # 3. Full-text fallback if repository supports it
+        if hasattr(self.neo4j_repo, "search_nodes_by_name"):
+            try:
+                fulltext_results = self.neo4j_repo.search_nodes_by_name(
+                    name_or_id, limit=config.ENTITY_RESOLVE_FULLTEXT_LIMIT
+                )
+                if fulltext_results:
+                    top_fulltext = fulltext_results[0]
+                    if self._token_overlap(name_or_id, top_fulltext.get("name", "")) >= 0.5:
+                        return top_fulltext
+            except Exception as e:
+                print(f"Error during full-text entity resolution: {e}")
+
+        # 4. Fallback to vector search with stricter acceptance checks
         try:
             results = self.neo4j_repo.vector_search(
-                name_or_id, top_k=3, score_threshold=0.5
+                name_or_id,
+                top_k=5,
+                score_threshold=config.ENTITY_RESOLVE_MIN_VECTOR_SCORE,
             )
             if results:
-                # If the top result is very good, use it (score > 0.8)
-                if results[0]["score"] > 0.8:
-                    return results[0]
-
-                # Otherwise, check if any result name is a substring or superstring
-                name_lower = name_or_id.lower()
-                for res in results:
-                    res_name = res.get("name", "").lower()
-                    if name_lower in res_name or res_name in name_lower:
-                        return res
-
-                # Fallback to top result
-                return results[0]
+                top = results[0]
+                second = results[1] if len(results) > 1 else None
+                if self._accept_vector_resolution(name_or_id, top, second):
+                    return top
         except Exception as e:
             print(f"Error during vector search resolution: {e}")
 
         return None
+
+    def _has_label(self, node: Dict[str, Any], canonical_label: str) -> bool:
+        labels = node.get("labels", []) if isinstance(node, dict) else []
+        return self._has_label_from_list(labels, canonical_label)
+
+    def _has_label_from_list(self, labels: List[str], canonical_label: str) -> bool:
+        target = canonical_label.lower()
+        return any(str(label).lower() == target for label in labels or [])
+
+    def _contains_any_label(self, labels: List[str], candidates: set) -> bool:
+        lowered = {str(label).lower() for label in labels or []}
+        return any(candidate.lower() in lowered for candidate in candidates)
+
+    def _normalize_for_match(self, text: str) -> str:
+        cleaned = re.sub(r"[^a-z0-9]+", " ", str(text or "").lower()).strip()
+        return re.sub(r"\s+", " ", cleaned)
+
+    def _token_overlap(self, query: str, candidate: str) -> float:
+        query_tokens = set(self._normalize_for_match(query).split())
+        candidate_tokens = set(self._normalize_for_match(candidate).split())
+        if not query_tokens or not candidate_tokens:
+            return 0.0
+        common = len(query_tokens & candidate_tokens)
+        return common / max(len(query_tokens), 1)
+
+    def _accept_vector_resolution(
+        self,
+        query: str,
+        top_result: Dict[str, Any],
+        second_result: Optional[Dict[str, Any]],
+    ) -> bool:
+        top_score = float(top_result.get("score", 0) or 0)
+        top_name = top_result.get("name") or top_result.get("id", "")
+        margin = top_score - float(second_result.get("score", 0) or 0) if second_result else 1.0
+        overlap = self._token_overlap(query, top_name)
+        normalized_query = self._normalize_for_match(query)
+        normalized_top = self._normalize_for_match(top_name)
+
+        exact_like_match = normalized_query == normalized_top
+        substring_match = (
+            normalized_query in normalized_top or normalized_top in normalized_query
+        ) and overlap >= config.ENTITY_RESOLVE_MIN_TOKEN_OVERLAP
+
+        return (
+            top_score >= config.ENTITY_RESOLVE_MIN_VECTOR_SCORE
+            and margin >= config.ENTITY_RESOLVE_MIN_SCORE_MARGIN
+            and (exact_like_match or substring_match or overlap >= 0.8)
+        )
 
     def get_multi_entity_context(
         self, entity_ids: List[str], max_depth: int = 3
